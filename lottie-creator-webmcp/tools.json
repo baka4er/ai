@@ -1,0 +1,1336 @@
+[
+  {
+    "group": "gateway",
+    "name": "read_scene",
+    "params": [],
+    "description": "Read the current Creator scene. Returns scene dimensions, framerate, duration, all layers, current selection, render order, visual bounds, scene-center deltas, and clipping/off-canvas flags. Call this once at the start of most turns to understand what's on the canvas. Use each layer's `ordering` and `layout` blocks to avoid wrong-layer, wrong-stack, and off-canvas mistakes. A layer may also carry an `occlusion` block (`likely_hidden: true`, `occluded_by: [ids]`) when an opaque layer in front of it covers it \u2014 treat that layer as INVISIBLE on the canvas (e.g. a label buried behind a button fill); reorder it above the cover with `reorder_layer` before reporting done. No input required \u2014 always reads the active scene.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "apply_keyframes",
+    "params": [
+      "layer_id",
+      "property",
+      "clear_first",
+      "keyframes"
+    ],
+    "description": "Add keyframes to ONE animatable property on ONE layer. This is the preferred tool for simple single-property animations (rotate, fade, slide, pulse, recolor). If you need to animate multiple properties on the same layer, plan separate tool calls in the order they should be applied; Creator serializes native tool execution through the dispatcher. **POLISH TURNS (snappier / smoother / tighter / less bouncy / fix timing / more premium / etc.) \u2014 call `read_keyframes` FIRST on every animated layer in scope BEFORE calling this tool.** The conversation history's view of existing keyframes is stale once the user edits in Creator directly; reading is the only safe source of truth. Then prefer the smallest possible mutation: easing-only change > retiming > amplitude tweak > full rebuild. See motion-design.md \u2192 'Repair / polish protocol' for the full rule. Value type depends on the property: - `position`, `scale` \u2192 value is `{x, y}`. **`scale` is a percentage of the layer's AUTHORED size, matching AE / Creator semantics \u2014 NOT a percentage of 100.** A layer the user imported or hand-resized can sit at `50`, `200`, `1250`, etc. \u2014 and THAT value is the resting state. Animating a layer authored at 1250 \u2192 110 collapses it to ~9% of its on-canvas size and looks like a bug. **Always read the current static value via `read_keyframes` or `read_scene` before writing scale keyframes**, then animate RELATIVE to that authored value (1250 pulses to 1350, not to 110). Same baseline rule applies to `position` and `rotation` \u2014 the layer's authored values are the resting state, not 0/0 or 0\u00b0. See motion-design.md \u2192 'Baseline awareness'. **TEXT `position` is doubly dangerous: a text layer's transform anchor is the baseline / box origin, so its raw `position` value is NOT its `visual_center` and NOT the `position` arg you gave `create_text` (that arg is the visual center). Feeding `visual_center` in as a `position` keyframe throws the text off-canvas. For a settle-into-place entrance use `animate_entrance` (no coordinate needed); for any other text move, `read_keyframes` the raw `static_value` and animate RELATIVE to it. Never repair a keyframed text layer with `set_anchor_point` \u2192 `center_layer` \u2014 they stack two shifts and fling it off-canvas.** - `rotation`, `opacity` \u2192 value is a number (rotation in degrees; opacity 0\u2013100) - `fill_color` \u2192 value is `{r, g, b}` with 0-255 per channel. **Requires a SOLID fill at `fills[0]`** \u2014 animation only works when the layer's first fill is SOLID. Gradient or empty layers will fail with `'Layer has no SOLID fill at fills[0]'`. To animate the color of a layer that currently has a gradient (or no fill), call `set_fill({type:'SOLID', color: <starting color>})` FIRST, then this tool. Verify the fill type via `read_scene` (look at the layer's fill metadata) or just call `set_fill` defensively before animating colors on a layer you didn't create with a solid fill. - `trim_start`, `trim_end` \u2192 number 0\u2013100 (percent of path). Use for stroke draw-on reveals: animate `trim_end` from 0 \u2192 100 to grow the path in. A trim path is auto-created on first use. If the current playhead stays at a frame where `trim_end` is 0 or opacity is 0, the layer is correctly present but invisible on canvas; after creating a reveal, call `set_current_frame` to leave Creator on a visible frame. - `trim_offset` \u2192 number 0\u2013360 (degrees around the path). For rotating-around-path effects. - `stroke_width` \u2192 number (pixels). Requires the layer to already have a stroke \u2014 use `set_stroke` first. To set a static color (no animation), pass a single keyframe at frame 0 and consider `clear_first: true` to remove any existing color animation. Easing is optional on any keyframe; omit it for linear-ish default. Use `CUBIC_BEZIER` with explicit control points for polished motion; `LINEAR` for deliberate no-easing. Use `clear_first: true` to replace existing keyframes on that property; otherwise new keyframes are merged with existing ones (sorted by frame). For paint, shape geometry, masks, groups, scene settings, and timing edits, prefer the dedicated typed tools (`animate_paint`, `animate_property`, `create_shape_group`, `update_mask`, `retime_keyframes`) over rebuilding with many generic keyframe calls. **RESPONSE \u2014 verify before saying \"Done\":** returns `{ layer_id, property, added, total_after }`. `added` is how many keyframes THIS call submitted; **`total_after` is a real read-back of how many keyframes the property holds afterwards** \u2014 it is re-read from the layer, not echoed from your input. - **Write success:** the call did not throw and the requested value was read back. A non-throwing one-keyframe write with `total_after: 1` is a valid static write. - **Animation success:** motion requires at least two distinct stored keyframe frames. After a multi-keyframe submission, `total_after: 1` means the write collapsed and the layer will not animate; call `read_keyframes` if the returned count or frames are unexpected. - With `clear_first: true`, expect `total_after === added`. A LARGER number means keyframes you did not write survived on that property and the result is a blend of old and new \u2014 `read_keyframes` before reporting done. - Without `clear_first`, `total_after` is the merged count. If it is lower than (previous + `added`), some of your frames landed on frames that already had keyframes and replaced them rather than adding. - Throws (and writes NOTHING) on an unknown `layer_id`, on a property that is not animatable on that layer, and on an unknown easing PRESET `name`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "apply_motion_preset",
+    "params": [
+      "layer_id",
+      "preset_id",
+      "mode"
+    ],
+    "description": "Apply a Motion Preset from the user's Motion System to a single layer. A preset is a multi-property keyframe collection for supported layer transform properties (position + scale + rotation + opacity, any subset) with a duration. This bakes the preset's keyframes into the layer \u2014 there's NO link semantics, future preset edits don't propagate. Preset trimPath data is not currently baked by the native gateway; use `apply_keyframes` on `trim_start`/`trim_end` for stroke reveals. Use this when the user names a preset (e.g. 'apply our brand entrance to this card'). For single-property motion (just an easing, just a duration), use `list_motion_system_items` + the existing keyframe tools instead \u2014 presets are the multi-property shortcut. **Mode** defaults to `'replace'` \u2014 this is what the user almost always wants. 'replace' clears existing keyframes on the preset's target properties first, then bakes the preset in. Only pass `'add'` when the user explicitly says 'on top of', 'in addition to', 'while keeping', 'compose with', or similar layering language. In `'add'` mode existing keyframes are preserved and the preset's absolute values are inserted with their frames shifted to the current playhead; scale/rotation/opacity are not added relative to the layer's current authored values. 'apply our brand entrance' = `'replace'`; 'apply our brand entrance while keeping the existing wobble' = `'add'`. Returns `{ layer_id, preset_id, preset_label, mode, duration_ms, affected_properties, applied_properties, readback }`. Success means the target layer was read back with changed, meaningful animated keyframes: at least one applied property has 2 or more distinct keyframe frames. Throws on unknown preset_id, unknown layer_id, presets with no meaningful supported motion, or actor no-ops/incompatible targets where no meaningful keyframes were actually created. If only some preset properties apply, inspect `applied_properties` and `readback` before describing the result to the user.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "apply_motion_path",
+    "params": [
+      "path_layer_id",
+      "target_layer_id",
+      "start_frame",
+      "end_frame",
+      "constant_speed",
+      "auto_orient",
+      "remove_source"
+    ],
+    "description": "Make a layer's position FOLLOW a path shape \u2014 Creator's 'apply path to motion' feature. Each vertex of the path becomes a position keyframe and the path's bezier in/out tangents become the keyframe's spatial tangents, so the layer curves smoothly along the path instead of jumping in straight-line segments between waypoints. **Reach for this when the user wants a custom curving motion** \u2014 'have the ball arc over the obstacle', 'make the icon trace an S-curve', 'follow this road', 'orbit around the logo', 'fly across the scene'. The path is a regular path shape created via `create_shape`/`bend_shape` (or any existing path in the scene). The motion is whatever curve the path describes. The tool writes SpatialKeyframes (the same primitive Creator's motion-path editor produces), which is the only way to get smooth curved motion between waypoints. Hand-authoring position keyframes via `apply_keyframes` gives straight-line interpolation between frames \u2014 fine for ramps and pulses, wrong for anything 'curve along this shape'. **Framing \u2014 the path must be centered on the scene:** - Read scene size first (`read_scene`). Set the path layer's `position` to the scene CENTER (e.g. `{ x: 256, y: 256 }` for 512\u00d7512). Author vertex positions as signed displacements from that center, capped at roughly \u00b1(scene_size/2 \u2212 40) so the motion stays inside the viewport with a margin (so x \u2208 [\u2212216, +216] on a 512-wide scene). - World motion coords are `layer.position + vertex`. If the target ends up off-canvas, either the layer wasn't centered or a vertex is past the viewport bound. Tangents can extend past the bound \u2014 only vertex anchor points need to stay inside. **Use TWO vertices for an S-curve, not three.** A 2-anchor bezier with strong opposing tangents produces a smooth flowing S; adding a middle vertex constrains the curve and tends to read as a zig-zag. Only use 3+ vertices when the user explicitly asks for a 'sharp' or 'kinked' S, or when the path has multiple distinct turns. **Tangent rules \u2014 get this right or the curve renders as a polyline:** - Tangent magnitude \u2248 30\u201350% of the distance to the adjacent vertex. Smaller flattens; larger loops. - For a smooth pass-through at any intermediate vertex, that vertex's inTan and outTan must be ANTI-PARALLEL \u2014 `outTan = -inTan`. Any other combo produces a visible corner. - For a TWO-vertex S, the start's outTan-y and the end's inTan-y must have OPPOSITE SIGNS (e.g. start outTan = (120, -150), end inTan = (-120, 150)). That sign flip is what creates the S inflection. Same-sign tangents produce an arc. - See `motion-patterns.md` \u2192 'S-curve recipe' for a worked 2-vertex example. Prerequisites: - `path_layer_id` points to a SHAPE_LAYER containing exactly one path shape with at least 2 vertices, OR to a path shape directly. - `target_layer_id` points to any transformable layer (shape, text, image, precomp). - Both layers must be in the active scene. Defaults: - `constant_speed: true` distributes the keyframes by arc length, so the motion is uniform along the curve (vs. evenly spaced in time, which makes long path segments visibly speed up). Leave it on unless the user asks for 'ease into corners'. - **`auto_orient`: pass `true` whenever the verb implies directional motion** \u2014 'fly', 'follow', 'swoop', 'travel', 'tour', 'drive', 'race', 'trace'. The target rotates to face the direction of travel for the entire path. Only leave `auto_orient: false` when the user explicitly wants the layer to keep its original orientation (e.g. 'slide along the path without rotating'). - `remove_source: true` deletes the source path layer after applying (the agent typically drew it as scaffolding). Pass `false` to keep the path visible in the scene.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_anchor_point",
+    "params": [
+      "layer_id",
+      "direction",
+      "position"
+    ],
+    "description": "Move a layer's ANCHOR POINT \u2014 the pivot for rotation and scale. Mirrors Creator's property-panel 9-grid anchor selector. Compensates the layer's position so the visible rendering DOES NOT JUMP when the anchor moves; if position is animated, every position keyframe shifts together so the motion shape is preserved. **Reach for this BEFORE animating rotation or scale** whenever the verb implies a specific pivot: - 'door opens / swings from the left hinge' \u2192 `direction: 'left'`, then animate rotation - 'drawer slides down from the top' / 'curtain drops' \u2192 `direction: 'top'`, then animate scale.y - 'pendulum / clock hand / chandelier swing' \u2192 `direction: 'top'`, then rotation - 'standing thing falls over' (tips on its base) \u2192 `direction: 'bottom'`, then rotation - 'pop in from the corner' / 'punch in from the bottom-right' \u2192 `direction: 'bottom-right'`, then scale + opacity - 'flag flapping from the pole on the left' \u2192 `direction: 'left'`, then rotation/skew **Critical: set the anchor BEFORE adding the rotation/scale keyframes.** Setting it AFTER moves where those existing keyframes pivot \u2014 the layer will appear to lurch because each frame's render uses the new pivot but the keyframed values were authored against the old one. Stage the anchor, then animate. Pass EXACTLY ONE of: - `direction`: one of 9 presets (top-left, top, top-right, left, center, right, bottom-left, bottom, bottom-right). The gateway maps to the corresponding corner / edge / midpoint of the layer's local bounding box. - `position`: raw `{x, y}` in layer-local pixels for custom placement (e.g. matching a specific anchor on a complex shape). If the layer has no clear bounding box (rare \u2014 text and shape layers always have one), the gateway falls back to a 100\u00d7100 box centered on local origin, so `direction` still gives sensible results.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_shape",
+    "params": [
+      "shape",
+      "size",
+      "fill_scene",
+      "points",
+      "outer_radius",
+      "inner_radius",
+      "outer_roundness",
+      "inner_roundness",
+      "roundness",
+      "radius_token",
+      "role",
+      "fill",
+      "path",
+      "position",
+      "rotation",
+      "scale",
+      "opacity",
+      "fill_color",
+      "stroke",
+      "name"
+    ],
+    "description": "**BEFORE CALLING: check the creation order.** New layers are inserted at the TOP of the render stack. If this turn creates multiple layers, emit the calls in BOTTOM\u2192TOP order \u2014 the background FIRST, the foreground LAST. A card background MUST be created BEFORE its content; a sky rectangle MUST be created BEFORE the logo on it. (Reorder APIs exist if needed via `reorder_layer`, but planning the order is cheaper.) Create a new shape layer with a vector primitive. Supports rectangle, ellipse, polygon (regular N-gon), star, and arbitrary bezier path. By default it gets a solid fill (`fill_color`, or gray if omitted). For a RING / outline / donut, pass `fill_color: \"none\"` + `stroke: { color, width }` \u2014 that's a stroke-only shape in ONE call. You can also combine a fill AND a stroke. Returns `layer_id` so you can immediately animate it with `apply_keyframes`. If the user asks for several shapes at once, emit one tool call per shape in the intended render order; Creator serializes native tool execution. **Position is the VISUAL CENTER for every primitive (rectangle, ellipse, polygon, star).** `path` is positioned at the layer origin and extends as its `path.points` define. A rectangle with `size: {512, 512}` at `position: {x:0, y:0}` in a 512\u00d7512 scene shows ONLY the bottom-right quadrant \u2014 its center is pinned to the scene's top-left corner. To cover that scene the position must be `{x:256, y:256}` (the rectangle's center \u2192 the scene's center). **BEFORE you reach for `fill_scene: true` \u2014 STOP. Do you actually need an exported background layer?** Motion-design convention: animations float on transparency so they composite anywhere. The exported Lottie keeps a transparent background \u2014 adding a full-scene rectangle BAKES IN a color the user almost never wants in the final file. The three valid reasons to add a background SHAPE LAYER: (1) gradient/multi-stop background that IS the design, (2) contrast genuinely unsolvable any other way, (3) the user EXPLICITLY says \"add a background layer\". For ALL other cases \u2014 including \"premium dashboard\", \"dark mode preview\", \"card on a tinted backdrop\" \u2014 use **`set_scene_background({ color })`** instead. That changes Creator's preview tint WITHOUT polluting the export. See motion-aesthetics \u2192 \"NO BACKGROUND LAYER BY DEFAULT\". `fill_scene: true` is for the narrow case where one of the three valid reasons above actually applies. The native tool reads the active scene's dimensions and sets `size` + `position` correctly. Only supported for `rectangle`. Parameter shape is a discriminated field \u2014 provide the params for the chosen shape: - `shape: \"rectangle\"` \u2192 `size: { width, height }` OR `fill_scene: true`. Optional `roundness` (px) \u2014 set this for ANY card/panel/modal/button; default-sharp corners read as wireframe. - `shape: \"ellipse\"` \u2192 `size: { width, height }`. - `shape: \"polygon\"` \u2192 `points` (number of sides, \u22653), `outer_radius` OR `size`, optional `outer_roundness` (0-100) - `shape: \"star\"` \u2192 `points` (\u22653), `outer_radius` + `inner_radius` OR `size` (inner defaults to half outer), optional `outer_roundness` / `inner_roundness` (0-100 each) - `shape: \"path\"` \u2192 `path: { points: [{vertex:{x,y}, inTan:{x,y}, outTan:{x,y}}, ...], closed: boolean }` Use one tool call per shape. 'Three circles stacked vertically' = 3 serialized create_shape calls.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "bend_shape",
+    "params": [
+      "layer_id",
+      "edge",
+      "amount",
+      "tangent_width",
+      "size",
+      "replace_original",
+      "preserve_fill",
+      "animate",
+      "amplitude",
+      "start_frame",
+      "repeat_count",
+      "repeat_interval_frames",
+      "decay",
+      "oscillations",
+      "frames_per_oscillation",
+      "clear_first"
+    ],
+    "description": "Bend one edge of an existing rectangle/square-like SHAPE_LAYER by replacing its first shape with a 5-point bezier path, OR animate an already-bent path by keyframing its pathData. Use this for prompts like 'bend the top of this square', 'curve the bottom edge', 'bow the card inward', or 'animate the bend'. Static bend: pass `amount` (typical 8-24px). Animated bend: pass `animate: true`; the tool reuses an existing bent PATH shape when present, infers its bounds, and writes pathData keyframes directly. Do NOT fake bend animation with scale keyframes. `tangent_width` controls how broad/smooth the curve is; default 60.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_text",
+    "params": [
+      "text",
+      "name",
+      "position",
+      "center_in_scene",
+      "rotation",
+      "scale",
+      "opacity",
+      "font_size",
+      "font_name",
+      "font_family",
+      "font_variant",
+      "align",
+      "line_height",
+      "tracking",
+      "text_caps",
+      "fill_color",
+      "stroke_color",
+      "stroke_width",
+      "wrap_width",
+      "role",
+      "fill"
+    ],
+    "description": "**BEFORE CALLING: check the creation order.** New text layers are inserted at the TOP of the render stack. If this turn also creates a card / background / banner, create the background FIRST and THIS text layer LAST \u2014 otherwise the text will land beneath the background. (Reorder APIs exist if needed via `reorder_layer`, but planning the order is cheaper.) Create a new native TEXT_LAYER with the given content and optional native TextDocument style. Returns `layer_id` so you can immediately animate it with `apply_keyframes` (opacity for fade-in, position for slide, scale for pop). For letter-by-letter or word-by-word staggered animations, emit one text-layer call per unit in the order they should be created; Creator serializes native tool execution. **Centering is by VISUAL BOUNDS, not layer origin.** Use `center_in_scene: true` for scene center. Use `position: {x,y}` when you want the bounds center at a specific target point (e.g. top-center hero text). Do not manually compensate for text origin/anchor. **For long body copy that needs to wrap, pass `wrap_width` instead of constructing a text box yourself.** The gateway translates `wrap_width` into a centered wrap box internally \u2014 your `position` / `center_in_scene` still controls visual placement. `wrap_width` without an explicit `align` uses center alignment; pass `align: \"left\"` for a conventional paragraph column. Omit `wrap_width` for headlines, subtitles, footers, single-line text. Native text styling supports font size, font family/variant or font name, fill color, stroke color/width, alignment, line height, tracking, caps, and `wrap_width`. For \"slight tracking\", use a small value such as 2-8; values around 20-40 are very wide and can make title text exceed the scene. **RESPONSE \u2014 verify these BEFORE saying \"Done\":** - `visual_center` is where the rendered text actually centers. Compare against your intent (`position` or scene center). - `visual_bounds` is the rendered rectangle in world coords. - `scene_fit.clipped` / `scene_fit.off_canvas` / `scene_fit.overflow.{left,right,top,bottom}`: if any overflow > 0, the new text is clipped at the canvas edge. Self-correct (reduce `font_size`, add `wrap_width`, shorten the text) or surface the limitation in one short line. See motion-design.md \u2192 \"Post-mutation layout integrity\".",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_text_group",
+    "params": [
+      "items",
+      "layout",
+      "gap",
+      "scene_anchor"
+    ],
+    "description": "**USE THIS for any prompt that asks for 2+ text layers as a coherent composition** \u2014 hero slides, title+subtitle+footer, label+value pairs, multi-line callouts. One tool call lays out the whole group with sensible typography defaults and centers it on the scene as a unit. Why this exists: composing the same layout out of `create_text` + `align_layer` typically takes 6-15 tool calls (create each, align each, shrink if clipped, re-center). This tool runs the equivalent sequence server-side with one response, picking Cal Sans (the project default), role-derived sizes (H2 = \u00bd \u00d7 H1), and the correct typography color hierarchy. **Roles** drive font_size + font_variant + fill_color + line-height + tracking when you don't override them (Slate ramp, never pure black; display headings get NEGATIVE tracking so they read tight, not loose): - `h1` \u2192 big bold slate-900 (the main title), tight leading, negative tracking - `h2` \u2192 half of H1, slate-600 (subtitle), slight negative tracking - `h3` \u2192 ~40% of H1, slate-600 - `body` \u2192 ~36% of H1, slate-600, neutral tracking - `caption` / `footer` \u2192 ~28% of H1, slate-500 (muted but readable) If you omit `role`, the position picks it: first item = h1, second = h2, rest = body. So `items: [{ text: 'Welcome' }, { text: 'Get started' }, { text: 'lottiefiles.com' }]` Just Works. **Sizing**: `font_size` defaults scale with the scene size \u2014 on a 512\u00d7512 canvas H1 \u2248 44px; on a 1080\u00d71080 canvas H1 \u2248 80px. Override `font_size` per item only when the design specifically calls for it. **Layout**: `vstack-centered` (the only mode for now) stacks items vertically with `gap` pixels between, centered horizontally on the scene, with the group's vertical center landing on `scene_anchor`. `scene_anchor: 'center'` (default) centers the whole stack. `'top-center'` biases it to the upper third; `'bottom-center'` to the lower third. Pass `{x, y}` for an arbitrary anchor. **RESPONSE**: returns `items: [{ layer_id, text, visual_center, visual_bounds, ... }, ...]`, `group_visual_bounds`, and `scene_fit` for the whole group. Check `scene_fit.clipped` and adjust the largest `font_size` once if the group overflowed \u2014 don't loop guessing sizes.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_button",
+    "params": [
+      "label",
+      "variant",
+      "fill_color",
+      "fill",
+      "radius_token",
+      "padding",
+      "font_size",
+      "font_variant",
+      "stroke",
+      "elevation",
+      "label_color",
+      "origin",
+      "group",
+      "name"
+    ],
+    "description": "Build a button / pill / chip in ONE call. Composes a rounded fill panel + a CENTERED label + optical padding (vertical < horizontal) + a WCAG-AA contrast-correct label color + correct z-order (label in front) + an auto elevation, grouped into one animatable precomp. **Use this instead of hand-rolling `create_shape` + `create_text` + `reorder_layer`** for any button/pill/chip/CTA/tag. It can't get the z-order, padding, radius, or label contrast wrong, and you never have to reference a layer id you're still creating. `variant`: `button` (md/8 radius), `pill` (stadium \u2014 auto-clamps to half the shorter side), `chip` (smaller, md/8). `fill_color` defaults to Slate-700 `{r:51,g:65,b:85}`; pass a REAL RGB object for an explicit CTA color, or `fill_color:'none'` + a `stroke` for an outlined button. Do not pass stringified JSON. `fill` is only an optional named Flat-UI accent string (e.g. 'peter-river') and is ignored when `fill_color` is provided. The **label color is auto-picked** (slate-50 vs slate-900, whichever clears AA on the fill) \u2014 only pass `label_color` to override, and it's kept only if it still passes AA. `elevation`: a tier (`resting`/`raised`/`floating`), or `false`/`'none'` to suppress the auto-resting lift. Returns `{ button_layer_id (the group), panel_layer_id, label_layer_id, label_color, contrast_ratio, passes_aa, visual_center, visual_bounds }` \u2014 animate the whole button via `button_layer_id` (e.g. `animate_entrance`).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_reference_board",
+    "params": [
+      "title",
+      "subtitle",
+      "sections",
+      "caption",
+      "gap",
+      "align",
+      "origin",
+      "group"
+    ],
+    "description": "Build a whole multi-section REFERENCE BOARD in ONE call \u2014 a title plus a stack of labelled sections. **This is the right tool for \"illustrate my motion system\", a style guide, a color-palette board, a token/spec sheet, an icon or feature list, or any reference overview.** Do NOT hand-place a board out of many `create_text` + `create_shape` calls \u2014 that scatters off-center, drops sections off-grid, and floats the title in the middle (the #1 failure mode). This composes everything into ONE `layout` column (origin scene-center), so the board is centered, evenly gapped, edge-aligned, safe-zone-fit, and on-canvas BY CONSTRUCTION. Each `section` has an optional `heading` and ONE content kind: `swatches` (color chips \u2014 a compact bare grid, or a {swatch,label} legend when \u22648 chips carry `label`s), `rows` ({label,value} spec rows), or `lines` (text specimens like font samples or easing values). Returns the composed `layout` result (`items`, `cascade_order` for `stagger_layers`, `content_bounds`, `created_layer_ids`).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_text",
+    "params": [
+      "layer_id",
+      "text",
+      "recenter"
+    ],
+    "description": "Update the text content of an existing TEXT_LAYER using native TextDocument APIs. By default the tool preserves the current visual bounds center after the text changes, so the layer does not jump when the new string is wider or narrower. **RESPONSE \u2014 verify before saying \"Done\":** returns `visual_center`, `visual_bounds`, and `scene_fit`. A string swap can push the new bounds past the canvas edge \u2014 check `scene_fit.clipped` / `scene_fit.overflow.{left,right,top,bottom}` after EVERY set_text. If anything overflows, self-correct (downscale `font_size` via `set_text_style`, add `wrap_width` via `set_text_style` for paragraph copy, or shorten the text) or surface the limitation in one short line. See motion-design.md \u2192 \"Post-mutation layout integrity\".",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_text_style",
+    "params": [
+      "layer_id",
+      "font_size",
+      "font_name",
+      "font_family",
+      "font_variant",
+      "align",
+      "line_height",
+      "tracking",
+      "text_caps",
+      "fill_color",
+      "stroke_color",
+      "stroke_width",
+      "wrap_width",
+      "recenter"
+    ],
+    "description": "Update native TextDocument styling on an existing TEXT_LAYER. Supports font size, font family/variant or font name, fill color, stroke color/width, alignment, line height, tracking, caps, and `wrap_width` (for paragraph copy that needs to wrap inside a fixed-width column). Setting `wrap_width` without an explicit `align` uses center alignment; pass `align: \"left\"` to keep a conventional paragraph column. Pass `fill_color: null` to clear the fill override, `stroke_color: null` to clear the stroke color override, and `stroke_width: null` to clear the stroke width override. By default it preserves the current visual bounds center after style changes. For \"slight tracking\", use 2-8, not 20-40. **RESPONSE \u2014 verify before saying \"Done\":** returns `visual_center`, `visual_bounds`, and `scene_fit`. Bumping `font_size` can push the rendered text past the canvas edge \u2014 check `scene_fit.clipped` / `scene_fit.overflow.{left,right,top,bottom}` after EVERY set_text_style call. If anything overflows, self-correct (smaller multiplier, add `wrap_width` to wrap, or bump the scene via `set_scene_settings`) or surface the limitation in one short line. See motion-design.md \u2192 \"Post-mutation layout integrity\".",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "measure_text_units",
+    "params": [
+      "layer_id",
+      "granularity"
+    ],
+    "description": "Return per-line, per-word, and per-character bounds for an existing text layer. Uses the same canvas.measureText pipeline that powers `read_scene`'s `measured_bounds`, but exposes the cumulative pen position per glyph so per-character recipes can place each new layer at the source's exact kerning \u2014 no `bounds.width / char_count` approximation. When to call (REQUIRED before splitting): - Any per-character recipe (typewriter, per-character-rise, bottom-up-letters, top-down-letters, kinetic-center-build, short-slide-*). - Any per-word recipe where each word needs its own layer (per-word-crossfade, spring-scale-in) so the rebuilt phrase reads as one centered unit. - Layout-aware effects that need exact word widths (short-slide-down, short-slide-right, kinetic-center-build). When NOT to call: - Whole-layer recipes (micro-scale-fade, fade-through, scale-down-fade, mask-reveal-up) \u2014 those animate one layer; `read_scene`'s `visual_bounds` is enough. - Layers that aren't text \u2014 call returns an error. Returns (positions match `read_scene`'s coordinate system): - `local_bounds` / `world_bounds` for the whole layer (matches `text_style.measured_bounds` and `layout.visual_bounds` from `read_scene`). - `font`: `{ name, size, tracking, line_height, alignment }` \u2014 pass these to `create_text` per character/word/line to preserve the source typeface. - `lines[]`: one entry per `\\n`-separated line. Each line carries `text`, `local_bounds`, `world_bounds`, and optionally `words[]` / `characters[]` depending on `granularity`. - `characters[i].local_bounds.x + width/2` is the visual CENTER of glyph i; use that as the `position.x` for the per-character layer. - `characters[i].advance_x_local` is the pen position AFTER glyph i (left edge of glyph i+1 with tracking applied). Sum across glyphs and you reproduce the line width. Granularity: - `line` \u2014 only line bounds. Cheapest. Use for per-line recipes. - `word` \u2014 adds word bounds inside each line. Use for per-word recipes. - `character` \u2014 adds character bounds inside each line. Use for per-character recipes. - `all` (default) \u2014 words + characters. Cheap; the heavy lifting is already done. Limits: - Measurement uses the active document fonts. If the layer's font hasn't loaded yet, widths fall back to a coarse `0.48 * fontSize` estimate (returned as one-line/zero-words/zero-characters in non-DOM contexts). Verify with `inspect_scene` if you suspect a font-load race. - The returned positions are in the same coordinate space as `read_scene` \u2014 `local_bounds` is relative to the layer's anchor (alignment already applied), `world_bounds` is in scene coordinates.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "split_text",
+    "params": [
+      "layer_id",
+      "granularity",
+      "delete_source",
+      "copy_style",
+      "animate"
+    ],
+    "description": "Split a text layer into one new text layer per character, word, or line at exact `measure_text_units` positions. Copies the source font/style to every new layer and (by default) deletes the source so the new layers don't render on top of the original. Replaces the manual `measure_text_units` \u2192 `delete_layer` \u2192 loop-of-create_text dance. When to call: - Any per-character recipe (typewriter, per-character-rise, bottom-up-letters, top-down-letters) \u2014 pass `granularity: 'character'`. - Any per-word recipe (per-word-crossfade, spring-scale-in) \u2014 pass `granularity: 'word'`. - Any per-line recipe (line-by-line-slide, mask-reveal-up) \u2014 pass `granularity: 'line'`. When NOT to call: - Whole-layer animations \u2014 there's only one layer; nothing to split. - You need different fonts per unit \u2014 split with `copy_style: false` then `set_text_style` per layer. - You want to animate the original AND a split copy \u2014 pass `delete_source: false`. Returns `{ source_layer_id, source_deleted, granularity, layers: [{ layer_id, text, position: {x,y}, bounds }] }`. The `layers` array is in reading order (line 0 first, then line 1, \u2026) so you can iterate with a running stagger index. Each `position` is the visual center of the unit in scene coordinates \u2014 already aligned with what `create_text` does when called with that position, so no `center_layer` follow-up is needed. Limits: - Up to ~80 units per call. Beyond that the per-create dispatch overhead dominates; consider `granularity: 'word'` instead of 'character' on long copy. - Splits are sequential, not transactional today \u2014 N undo steps, not one. Plan accordingly when chaining with other edits. - Spaces ARE returned as their own layers when `granularity: 'character'` (their bounds may be zero-width). Skip them client-side if your recipe doesn't animate them, but keep the layer count exact if your stagger formula uses `i` as the index.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "stagger_layers",
+    "params": [
+      "layer_ids",
+      "preset",
+      "per_item_delay_frames",
+      "start_frame",
+      "duration_frames",
+      "easing",
+      "distance",
+      "direction",
+      "fade"
+    ],
+    "description": "Apply a staggered entrance to MANY existing layers in ONE call \u2014 each layer enters slightly after the previous, reading as one cascading sequence. This replaces the per-layer `set_anchor_point` + 2\u00d7`apply_keyframes` loop (\u22483N calls) that the agent used to hand-roll for letter cascades, card grids, list reveals, etc. The stagger reads EACH layer's own resting position, so it's safe on already-distinct layers (split-text letters at their kerned spots, grid cards at their slots) \u2014 unlike `copy_animation`, which would copy one layer's absolute position onto all the others and collapse them into a single spot. Layer order in `layer_ids` IS the cascade order. Each layer gets a frame-0 hold so it stays invisible/offset until its turn (no 'everything visible at frame 0' bug). Returns `{ staggered, last_entrance_end_frame, ... }` \u2014 use `last_entrance_end_frame` to place the NEXT beat (subtitle, button) so the whole scene reads as one composed sequence. For 'letters slide up with a 10-frame stagger', either call `split_text` with its `animate` option (one call total), or split then call this with `{ preset: 'slide', direction: 'up', per_item_delay_frames: 10 }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "animate_entrance",
+    "params": [
+      "layer_id",
+      "style",
+      "direction",
+      "distance",
+      "frames",
+      "start_frame",
+      "easing"
+    ],
+    "description": "Animate ONE layer's entrance (a settle-into-place reveal) WITHOUT supplying any position coordinate. The tool reads the layer's OWN resting transform and animates relative to it, so the layer settles back EXACTLY where it rests. **This is the SAFE path for a TEXT reveal.** A text layer's `position` keyframes live in RAW transform (baseline / box-origin) space \u2014 which is DIFFERENT from `visual_center` and from the `position` arg you passed to `create_text` (that arg is the visual center). Reusing the visual center as a `position` keyframe value silently throws the text off-canvas (the cause of a 30-call, 3-rebuild logo-reveal failure). `animate_entrance` takes no coordinate, so that mistake is impossible. Use it right after creating a layer to give it a premium entrance. `style`: `rise` (slide up into place, position only), `rise-fade` (slide + fade, the default), `fade` (opacity only), `scale` (grow from a centered anchor + fade). It only SETTLES the layer to its current resting spot \u2014 it is not a relocate, and it must NOT be re-run on a layer that already has position keyframes. Do NOT chain `set_anchor_point` or `center_layer` before/after it. For MANY layers cascading, use `stagger_layers`. For a non-entrance move along a path, read the raw `static_value` via `read_keyframes` and use `apply_keyframes` relative to it. Returns `{ layer_id, style, entrance_start_frame, entrance_end_frame, duration_frames }` \u2014 use `entrance_end_frame` to time the next beat.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_fonts",
+    "params": [
+      "source"
+    ],
+    "description": "List font families available in the active project \u2014 Creator's curated presets, Google Fonts, OS-installed local fonts (when permission has been granted), and project-uploaded font assets. Use this when the user names a specific font you're not sure is loaded ('animate \"Acme\" in Bebas Neue letter-by-letter'), or when you need to recommend a fallback that's actually present. When to call: - User names a font you're not certain exists in this project (brand fonts, niche typefaces). - You're about to call `create_text` / `set_text_style` with a specific `font_name` and want to verify the family + style are loaded. - You're deciding between multiple style options for the same family. When NOT to call: - The user didn't specify a font \u2014 `create_text` uses the project default. Calling this would just burn a turn. - You already called it earlier in the conversation. Returns `{ families: [{ family, styles, default_style, source }] }`. `source` is one of `'PRESET' | 'GOOGLE_FONT' | 'LOCAL' | 'ASSET'`. If the requested family isn't in the list, fall back to a similar style + tell the user (e.g. 'Bebas Neue isn't loaded; I used Anton, the closest condensed sans available'). Pass `source` to filter to one category. Note: the catalog is a snapshot of what's currently loaded. Local OS fonts only appear after the user grants the browser's `local-fonts` permission, which Creator does not prompt for automatically.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "center_layer",
+    "params": [
+      "layer_id",
+      "target"
+    ],
+    "description": "Reposition an EXISTING layer so its visual center lands on a SPECIFIC target point (e.g. a callout at `(180, 380)`, or anywhere off-center). For text, this uses rendered bounds when Creator has them and measured text bounds otherwise, so it avoids the top-left/origin centering bug. **For aligning to scene center (the common case), use `align_layer({ direction: 'horizontal-center' })` + `align_layer({ direction: 'vertical-center' })` instead \u2014 that's Creator's own alignment path and the more reliable default.** Use `center_layer` only when the target is not the scene center. For a brand-new centered text layer, prefer `create_text` with `center_in_scene: true`. **RESPONSE \u2014 verify before saying \"Done\":** - `target_reached` is the authoritative placement result: `true` only when both an independent rendered-bounds check and the returned `visual_center` match the target within ~1px; `false` when a rendered verification result exists but its center misses, or the returned `visual_center` is unavailable or misses; and `undefined` when no target or rendered verification result is available, including unavailable bounds, verification errors, or the 1,500ms timeout. **If it is not `true`**: retry with `align_layer` (which uses Creator's authoritative alignment math), OR surface the limitation to the user in one short line. - `visual_center` may be the projected post-mutation center while rendering settles. Use it to understand the returned layout, not as proof that the move landed. - For text layers the response intentionally omits `position` \u2014 the layer's transform anchor sits at the baseline/box origin, not the visual center. - `scene_fit` also returned so you can confirm the layer didn't end up clipped. See motion-design.md \u2192 \"Post-mutation layout integrity\".",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_fill",
+    "params": [
+      "layer_id",
+      "replace_first",
+      "fill"
+    ],
+    "description": "Set (or replace) the fill on a SHAPE_LAYER. Supports SOLID colors AND linear/radial gradients. **Picking a default color (no brand defined, no mood specified):** check `list_slots` and `list_motion_system_items` first. If both empty and the user didn't name a color, stay MONOCHROME \u2014 Slate-700 `{r:51,g:65,b:85}` for accents / buttons, Slate-50 `{r:248,g:250,b:252}` for surfaces. Indigo / purple / pink / teal as defaults read as AI slop. When the user DOES name a color or mood, pick from the Flat UI defo palette (see `motion-aesthetics` skill) instead of inventing Tailwind values. ONE chromatic accent + neutrals; no rainbow palettes. **Defaults to replacing `fills[0]`.** Pass `replace_first: false` to append as a second fill instead. Color stops: each stop has `offset` (0\u20131, position along the gradient line), `color` ({r,g,b} 0\u2013255), and optional `opacity` (0\u20131, default 1). Keep stop count modest (2\u20135 stops typical). For premium 'glow' effects fade the color to pure black and set blend mode with `set_blend_mode`. **Gradient geometry \u2014 `start` / `end` are PIXEL coordinates in layer-local space (NOT normalized 0\u20131 ratios).** The shape primitive sits at the layer's local origin (0, 0); a rectangle/ellipse with size {W, H} extends from (-W/2, -H/2) to (+W/2, +H/2). The gradient line runs from `start` to `end`; offset 0 is at `start`, offset 1 is at `end`. Common patterns for a centered shape with size {W, H}: | Direction | start | end | | ---------------- | -------------- | -------------- | | Top \u2192 bottom | {x:0, y:-H/2} | {x:0, y:H/2} | | Bottom \u2192 top | {x:0, y:H/2} | {x:0, y:-H/2} | | Left \u2192 right | {x:-W/2, y:0} | {x:W/2, y:0} | | Diagonal TL\u2192BR | {x:-W/2, y:-H/2}| {x:W/2, y:H/2}| | Radial center-out| {x:0, y:0} | {x:W/2, y:0} | **Omit `start`/`end` entirely if you don't have a strong opinion** \u2014 the native tool computes sensible pixel defaults from the layer's bounds (linear: top\u2192bottom; radial: center\u2192edge). Do NOT pass {0, 0}\u2013{0, 1} or {0.5, 0}\u2013{0.5, 1} thinking those are 'normalized' coordinates: those would render the gradient inside a 1-pixel strip and you'll see only the first stop's color across the entire shape. - Radial-only: `highlightAngle` (degrees) and `highlightLength` (-100 to 100) shift the focal point off-center. To animate paint, use `animate_paint` for gradient stops/handles or `apply_keyframes` with `fill_color` for SOLID color cycles. `set_fill` is for changing the static fill kind.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_stroke",
+    "params": [
+      "layer_id",
+      "width",
+      "replace_first",
+      "fill"
+    ],
+    "description": "Set (or replace) the stroke on a SHAPE_LAYER. Mirror of `set_fill` but for outlines/lines, plus a `width` (pixels). Supports SOLID and gradient strokes (same stop structure as set_fill). Defaults to replacing `strokes[0]`. Pass `replace_first: false` to append. After the stroke exists, you can animate its width over time with `apply_keyframes` property 'stroke_width'.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "animate_paint",
+    "params": [
+      "layer_id",
+      "target",
+      "paint_index",
+      "ensure",
+      "property",
+      "clear_first",
+      "keyframes"
+    ],
+    "description": "Keyframe fill or stroke paint directly. Use this for true animated gradients: create/ensure a gradient fill or stroke, then animate `gradient_stops`, `gradient_start`, `gradient_end`, or radial highlight properties. Use `solid_color` for a SOLID paint color cycle. This is the preferred tool for prompts like 'add animated gradients', 'make the gradient sweep', or 'animate the stroke colors'.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "animate_property",
+    "params": [
+      "layer_id",
+      "property",
+      "target_index",
+      "target_id",
+      "clear_first",
+      "keyframes"
+    ],
+    "description": "Keyframe extended properties not covered by apply_keyframes, including paint opacity/color, gradient handles, shape geometry, mask path/opacity, text animator colors, and scene-layer time mapping. Use this when the property is explicitly named and a typed high-level tool is not a better fit. **Which sub-object gets animated** \u2014 the `property` picks a list on the layer, and `target_id`/`target_index` pick one entry in that list. **Both are optional and default to the FIRST entry**, which is what you want on the common single-mask / single-fill / single-shape layer: - `mask_path`, `mask_opacity` \u2192 the layer's masks (id from `create_mask`). - `shape_path`, `shape_size`, `rectangle_roundness`, `outer_radius`, `inner_radius`, `outer_roundness`, `inner_roundness`, `polygon_points`, `star_points` \u2192 the layer's shapes (id from `add_shape_to_layer`). - `stroke_color`, `stroke_opacity` \u2192 the layer's strokes; `fill_opacity`, `gradient_stops`, `gradient_start`, `gradient_end`, `highlight_angle`, `highlight_length` \u2192 the layer's fills, falling back to strokes when there is no matching fill. - `text_fill_color`, `text_stroke_color`, `text_stroke_width` \u2192 the layer's text animators (falls back to the layer itself when it has none). - `time_mapping` \u2192 the layer itself; both targeting fields are ignored. **RESPONSE:** returns `{ layer_id, property, target_index, target_id, added, total_after }`. `total_after` is a read-back of the keyframe count on the resolved property \u2014 treat `total_after >= 2` as the success predicate for an animation. Throws when the property is not available on the resolved target (e.g. `mask_path` on a layer with no masks).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_blend_mode",
+    "params": [
+      "layer_id",
+      "blend_mode"
+    ],
+    "description": "Set a layer's blend mode. One of: normal, multiply, screen, overlay, darken, lighten, color-dodge, color-burn, hard-light, soft-light, difference, exclusion, hue, saturation, color, luminosity. Common uses: - `screen` \u2192 glow / shine / highlight layers (fades to black = invisible) - `multiply` \u2192 shadows / darkening overlays - `overlay` / `soft-light` \u2192 color tinting - `difference` \u2192 inverting effects",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_drop_shadow",
+    "params": [
+      "layer_id",
+      "color",
+      "elevation",
+      "opacity",
+      "angle",
+      "distance",
+      "blur",
+      "name"
+    ],
+    "description": "Attach a native Drop Shadow effect to a layer. Renders in Creator's preview and in dotlottie-web (the default Lottie player). lottie-web silently drops it. Use for: card/panel shadows, button lift, soft glow (distance=0 + large blur), text shadow. **Replaces the legacy 'duplicate dark rectangle behind the card' workaround** \u2014 call this instead. **Prefer `elevation` for UI surfaces.** Pass `elevation:'resting'|'raised'|'floating'` to attach a tuned TWO-shadow stack (a tight contact shadow + a soft ambient one, slate-tinted) in one call \u2014 this reads far more premium than a single hand-tuned shadow. `resting` = a card at rest, `raised` = hover/lifted, `floating` = modal/popover. When `elevation` is set the manual color/opacity/angle/distance/blur are ignored. Manual single-shadow param tips (when NOT using `elevation`): - `color` defaults to black {r:0,g:0,b:0}. Tint toward dark slate {r:15,g:23,b:42} for premium UI shadows. - `opacity` is 0-255 (Lottie convention). 191 \u2248 75% (default). 64 \u2248 25% for subtle, 230 \u2248 90% for dramatic. - `angle` in degrees, 135 = bottom-right (default). 90 = straight down, 270 = straight up. - `distance` in px. 0 = no offset (creates a soft glow). 4-8 = resting card. 12-24 = floating/modal lift. - `blur` in px. 0-2 = hard shadow. 8-15 = soft. 20-40 = very soft. Default 20.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_blur",
+    "params": [
+      "layer_id",
+      "sigma",
+      "direction",
+      "wrap",
+      "name"
+    ],
+    "description": "Attach a native Gaussian Blur effect to a layer. Renders in Creator's preview and in dotlottie-web. lottie-web silently drops it. Use for: blurred backgrounds, focus/defocus effects, soft glow with drop_shadow distance=0, glassy/frosted surfaces. Param tips: - `sigma` (px): blur strength. 5-10 = subtle, 15-25 = noticeable, 30-60 = dreamy/dramatic. Default 20. - `direction`: 0 = both axes (default), 1 = horizontal only, 2 = vertical only. - `wrap`: 0 = clamp edges (default, normal). 1 = repeat. Almost always leave at 0.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_color_overlay",
+    "params": [
+      "layer_id",
+      "color",
+      "opacity",
+      "name"
+    ],
+    "description": "Attach a native Fill effect that overlays a solid color on the layer (multiply-style recolor). Renders in dotlottie-web; lottie-web drops it. Use for: recoloring imported SVG/image content without editing the source paths, hover-state overlays, themed tints. For shape layers you usually want `set_fill` instead \u2014 this is for cases where the layer's intrinsic fill should stay and a color washes over it. Param tips: - `color` required, RGB 0-255. - `opacity` 0-1 (Lottie Fill convention, not 0-255). Default 1 (full overlay).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_tint",
+    "params": [
+      "layer_id",
+      "black",
+      "white",
+      "intensity",
+      "name"
+    ],
+    "description": "Attach a native Tint effect (two-color recolor: dark pixels \u2192 black color, light pixels \u2192 white color, with adjustable intensity). Renders in dotlottie-web; lottie-web drops it. Use for: duotone treatments, retro/poster looks, single-color overlays that preserve luminance variation. NOT for replacing a single fill color \u2014 use `set_fill` for that. Param tips: - `black` color maps to the darkest pixels (default {0,0,0}). - `white` color maps to the brightest pixels (default {255,255,255}). - `intensity` 0-100: 0 = no effect, 100 = full duotone replacement (default 100).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_tritone",
+    "params": [
+      "layer_id",
+      "highlight",
+      "midtone",
+      "shadow",
+      "intensity",
+      "name"
+    ],
+    "description": "Attach a native Tritone effect (three-color recolor: highlight + midtone + shadow). Renders in dotlottie-web; lottie-web drops it. Use for: cinematic color grading, three-tone aesthetic treatments (sepia, vintage, dusk), branded recolors with more depth than `add_tint`. Param tips: - `highlight` color maps to brightest pixels (default white). - `midtone` color maps to middle luminance (default gray). - `shadow` color maps to darkest pixels (default black). - `intensity` 0-100: 0 = no effect, 100 = full recolor (default 100).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_layer_effects",
+    "params": [
+      "layer_id"
+    ],
+    "description": "Return the effects currently attached to a layer, with their ids, types, and enabled state. Call this before stacking another effect, before removing one, or whenever you need to know what's already there.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_layer_effect",
+    "params": [
+      "layer_id",
+      "effect_id"
+    ],
+    "description": "Remove a specific effect from a layer. Call `list_layer_effects` first to get the `effect_id`. Other effects on the layer are left intact.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "update_layer_effect",
+    "params": [
+      "layer_id",
+      "effect_id",
+      "slot_index",
+      "value"
+    ],
+    "description": "Nudge one slot on an existing effect without removing and re-adding it. Use this when the user asks to refine an effect ('a bit more blur', 'darken the shadow', 'rotate the shadow direction') \u2014 much cheaper than `remove_layer_effect` + `add_*` and preserves the slot order. **Slot indices** (match the parser order \u2014 see add_* tool docs): - Drop shadow: 0=color, 1=opacity (0-255), 2=angle (degrees), 3=distance (px), 4=blur (px) - Gaussian blur: 0=sigma, 1=direction (0|1|2), 2=wrap (0|1) - Fill (color overlay): 2=color, 6=opacity (0-1) - Tint: 0=black color, 1=white color, 2=intensity (0-100) - Tritone: 0=highlight, 1=midtone, 2=shadow, 3=intensity (0-100) Pass `value` as a number for scalar/angle slots and as an `{r,g,b}` triplet for color slots. Call `list_layer_effects` first if you don't already have the `effect_id`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_themes",
+    "params": [],
+    "description": "List the themes embedded in this file. Themes group design-token slots (brand colors, named text strings, etc.). The Default theme is always present; users can add named alternates (e.g. 'Dark', 'Holiday'). Returns `{ themes: [{ id, slot_count, is_active }] }`. Call before `list_slots` if the user references a specific theme by name, or to confirm that any tokens exist before suggesting slot-based edits.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_slots",
+    "params": [
+      "type",
+      "theme_id"
+    ],
+    "description": "List design-token slots defined in the file. Each slot has ONE stable id (e.g. 'brand-red') but can supply different VALUES per theme \u2014 Default theme might have brand-red as crimson, a Dark theme might have it as burgundy. The toolkit renders whichever value the currently active theme provides. Use before inventing hardcoded values whenever the user names a brand concept ('brand red', 'primary blue', 'the header color', 'our headline text'). Filter with `type` to narrow (e.g. COLOR for fill/stroke pickers, TEXT for headline strings). Returns `{ slots: [{ id, type, values_by_theme: { themeId: value, ... }, active_theme, active_value }] }`. Without `theme_id`, `active_value` is what the canvas renders right now. With a `theme_id` filter for an inactive theme, `active_value` may be that filtered theme's fallback value for inspection, while `active_theme` still names the canvas-rendered theme. The `values_by_theme` map shows variants if the user wants to recolor a specific theme. Empty `slots` means the file has no tokens of that type \u2014 fall back to inline values and say so.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_motion_system_items",
+    "params": [
+      "type"
+    ],
+    "description": "Read the user's Motion System library \u2014 a separate design library from the file's theme slots. Returns colors / gradients / fonts / easings / durations / motion presets that the user has saved (typically synced from Workflow). Use this when the user names a brand value (e.g. 'brand red', 'standard ease-out', 'fast duration') and `list_slots` did NOT find a match \u2014 motion system is the fallback library. The values are returned for inline use (set_fill with the rgb you found, apply_keyframes with the control_points you found, etc.) \u2014 they are NOT linked tokens. For multi-property motion presets, use `apply_motion_preset` instead of trying to reconstruct the keyframes. **Hierarchy:** theme slots beat motion-system entries. Always `list_slots` first; only fall through to `list_motion_system_items` on a miss. **Colors vs gradients \u2014 same UI section, two enum values.** The Motion System UI shows solid colors AND gradients together under one 'Brand Colors' tab, so a name the user thinks is a 'color' may actually be a gradient (e.g. a logo gradient saved as `clogo`). When the user names a color and `type: 'colors'` returns no match, ALWAYS try `type: 'gradients'` before giving up. Only declare 'not found' after BOTH lookups miss. Returns `{ items: [...] }` typed per family (see schemas below). Pass no `type` to get a summary across all families. Order of `animated_properties` on motion-preset items is not guaranteed; treat as a set.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "link_slot_to_layer",
+    "params": [
+      "slot_id",
+      "layer_id",
+      "shape_type",
+      "property_context",
+      "opacity_source"
+    ],
+    "description": "Link an existing design-token slot to a layer's property so the property reads from the slot reference instead of a hardcoded value. Future slot updates propagate automatically (this is the whole point of slots). Call `list_slots` first to find the slot id. **The link is to the slot id, NOT to a specific theme's value.** Whichever theme is active at render time supplies the color/text. If the user later switches themes, the linked layer follows the new theme's value automatically. You never pass a theme id here. What each `slot_type \u2192 shape_type` does: - `COLOR` + `shape_type: FILL` (default for shape layers): replaces the layer's fill color with the slot reference. - `COLOR` + `shape_type: STROKE`: replaces the layer's stroke color. - `TEXT` on a text layer: replaces the text content with the slot's string. Ignore `shape_type` for text. - `GRADIENT` + `shape_type: GRADIENT_FILL` / `GRADIENT_STROKE`: replaces the gradient. - `POSITION` / `VECTOR`: links the matching transform property; `shape_type` ignored. - `SCALAR`: links rotation / opacity / skew / skew_axis / stroke_width and REQUIRES `property_context`; `shape_type` ignored. Opacity additionally accepts `opacity_source: 'layer' | 'fill'` and defaults to `'layer'`. Returns `{ slot_id, layer_id, slot_type, shape_type }` on success. Errors if the slot or layer is missing, if `property_context` is missing for SCALAR, or if the slot type is incompatible with the layer (e.g. text slot on a shape layer).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_slot",
+    "params": [
+      "slot_id",
+      "type",
+      "layer_id",
+      "shape_type",
+      "property_context",
+      "opacity_source",
+      "link_source"
+    ],
+    "description": "Create a new design-token slot (motion token) by capturing the current value of a layer property. The slot's value comes FROM the layer \u2014 you cannot create a slot from an arbitrary RGB/text input. The typical agent flow is: (a) `set_fill` (or set rotation/opacity/scale/etc.) on the layer to the target value, then (b) `create_slot` to capture it as a named token. By default the source layer is linked to the new slot so future updates propagate. **SCALAR slots** (rotation / opacity / skew / skew_axis / stroke_width) share one slot type, so they REQUIRE `property_context` to pick the source property \u2014 without it the capture is ambiguous and the call fails. Opacity additionally takes `opacity_source: 'layer' | 'fill'` (defaults to `'layer'`). Returns `{ slot_id, type, theme_id, property_context }`. Errors if the slot name is invalid, already exists, or the layer has no property of the requested kind (e.g., COLOR + FILL on a text layer, SCALAR + rotation on a fully-locked transform). **Slot name rules:** lowercase letters / numbers / underscore / dash, 1\u201364 chars, must be unique across all themes. If the user gives an unsupported name (spaces, punctuation, uppercase), normalize it (e.g., 'Brand Red' \u2192 'brand-red') and tell them in the reply.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_slot_from_value",
+    "params": [
+      "slot_id",
+      "type",
+      "color"
+    ],
+    "description": "Create a new COLOR design-token slot DIRECTLY from a value \u2014 no source layer required, no scratch-shape dance. Use this when the agent has a `{r, g, b}` in hand (e.g. from `list_motion_system_items`) and wants to register it as a token the user can link future layers to. **When to use this vs `create_slot`:** - `create_slot_from_value`: agent has a value, no source layer. Common after a motion-system lookup: 'tokenize the motion-system primary color' \u2192 `list_motion_system_items` \u2192 `create_slot_from_value`. - `create_slot`: agent wants to capture a layer's existing fill/stroke/etc. value AND optionally link the source. The traditional flow when the user has selected a layer they want to tokenize from. **Linking is separate.** This tool only registers the slot. To link a layer, call `link_slot_to_layer` afterwards. **Current limitation: COLOR only.** Other slot types (TEXT, GRADIENT, POSITION, VECTOR, SCALAR) still require the scratch-shape pattern via `create_slot`. The tool throws a clear error if you pass a non-COLOR type. Returns `{ slot_id, type, theme_id, value }`. Errors on duplicate name or invalid slot id (lowercase / digits / underscore / dash, 1-64 chars).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "update_slot_value",
+    "params": [
+      "slot_id",
+      "theme_id",
+      "color",
+      "text",
+      "gradient",
+      "position",
+      "scale",
+      "scalar"
+    ],
+    "description": "Change the value of an existing design-token slot in one theme. Every layer linked to the slot updates automatically when that theme is the active one \u2014 this is the canonical 'recolor everything that uses brand-red' / 'shift all opacity tokens by 20%' operation. **Themes are per-value scopes.** A slot has one id but multiple values, one per theme. By default this writes to the currently active theme (the one the canvas is rendering). Pass `theme_id` to write to a non-active variant \u2014 useful for setting 'Dark' theme colors without leaving the active theme. The response's `applied_to_active_theme: false` plus `note` field tells you when the canvas won't visibly redraw (you targeted an inactive theme). **Provide exactly one value param matching the slot's type:** - `color: { r, g, b, a? }` for COLOR slots - `text: string` for TEXT slots - `gradient: { stops: [{ offset, r, g, b, a? }, ...] }` for GRADIENT slots \u2014 stops sorted by offset 0..1 - `position: { x, y }` for POSITION slots - `scale: { x, y }` for VECTOR slots (scale; e.g. `{ x: 100, y: 100 }` for 100%) - `scalar: number` for SCALAR slots \u2014 interpreted by the underlying property: degrees for rotation/skew, percent 0..100 for opacity, pixels for stroke_width Rejects type mismatches (e.g. `color` on a TEXT slot) and unknown theme ids. Returns `{ slot_id, theme_id, type, value, applied_to_active_theme, note? }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "unlink_slot",
+    "params": [
+      "layer_id",
+      "slot_type",
+      "shape_type",
+      "property_context",
+      "opacity_source"
+    ],
+    "description": "Disconnect a layer's property from its design-token slot. The property keeps its current value (frozen at the moment of unlink) but stops following the slot \u2014 future `update_slot_value` calls on that slot no longer affect this layer. Use when the user says things like 'detach this from the brand color', 'stop using the token here', 'this one should be one-off', 'break the link'. Returns `{ layer_id, slot_type, shape_type, property_context, unlinked }`. **For SCALAR slots, `property_context` is required** \u2014 SCALAR is shared by rotation, opacity, skew, skew_axis, and stroke_width, so the gateway needs to know which property to unlink. For OPACITY specifically, optionally pass `opacity_source: 'layer' | 'fill'` to disambiguate between layer transform opacity and a shape's fill opacity (defaults to `'layer'`).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_theme",
+    "params": [
+      "id"
+    ],
+    "description": "Create a new theme. The new theme starts with copies of the Default theme's slots (so every slot id continues to render with a value when this theme is active). Use this when the user asks for a 'Dark' / 'Holiday' / etc. variant before customizing values. After creating, the agent typically wants to (a) `select_theme` to make it active, and (b) `update_slot_value({ theme_id, color | text })` per slot to give the new theme its own values. **Naming rules:** lowercase / digits / underscore / dash, 1\u201364 chars. Convert unsupported user-facing names before calling this tool (for example, 'Holiday Theme' \u2192 `holiday-theme`). If there's a collision with an existing theme id, theme-manager appends a suffix and the response returns the actual id used. Returns `{ theme_id, was_renamed }`. `was_renamed: true` means theme-manager picked a different id than requested (collision); surface that to the user.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "select_theme",
+    "params": [
+      "theme_id"
+    ],
+    "description": "Switch the currently active theme. The canvas immediately re-renders using the new theme's slot values \u2014 every layer linked to a token shifts to the new theme's value for that slot. Use when the user says 'switch to Dark', 'preview the Holiday theme', 'show me what this looks like with the alt theme'. Also useful right after `update_slot_value({ theme_id: 'Dark', ... })` if the user wants to see the change live. Returns `{ active_theme }`. Throws if the theme id doesn't exist.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_theme",
+    "params": [
+      "theme_id"
+    ],
+    "description": "Delete a theme and all its per-slot value variants. Slot ids stay; only the per-theme values defined in this theme are removed. The Default theme cannot be removed \u2014 that always exists. Use when the user asks to drop a variant they no longer want ('get rid of the Holiday theme'). If the deleted theme was active, the active theme falls back to Default. Returns `{ removed: true, theme_id }`. Throws if the theme is 'Default' or doesn't exist.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_segments",
+    "params": [],
+    "description": "List the named animation segments (markers) on the active scene. Each segment is a name + a frame range (start_frame, end_frame). Segments are used by Lottie players to loop / play named ranges and by dotLottie state machines as playback targets. Returns `{ segments: [{ id, name, start_frame, end_frame, duration_frames }] }`. Empty array means the scene has no segments yet. Call before `add_segment` if you need to check for duplicate names, before `add_state` on a state machine that targets a segment, or whenever the user asks 'what segments / loops / chapters does this animation have?'.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_segment",
+    "params": [
+      "name",
+      "start_frame",
+      "end_frame"
+    ],
+    "description": "Add a named segment (marker) to the active scene's timeline. Segments are reusable named frame ranges \u2014 players can loop on one, dotLottie state machines can reference one by name. Returns `{ segment_id, name, start_frame, end_frame }`. The `segment_id` is the toolkit node id; subsequent rename / remove / select calls take this id. **Name uniqueness:** segments don't enforce unique names at the toolkit level, but the agent should avoid duplicate names (state machines reference segments by name and a collision is ambiguous). Call `list_segments` first if unsure.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "rename_segment",
+    "params": [
+      "segment_id",
+      "name"
+    ],
+    "description": "Rename an existing segment. Other properties (frames) are unchanged. If state machines reference the old name, they will NOT auto-update \u2014 the agent or user must fix those references separately. Returns `{ segment_id, name }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_segment",
+    "params": [
+      "segment_id"
+    ],
+    "description": "Delete a segment from the active scene. Layer timing and keyframes are NOT affected \u2014 segments are pure metadata. If state machines reference this segment, they will break at runtime; clean those up separately. Returns `{ removed: true, segment_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "select_segment",
+    "params": [
+      "segment_id"
+    ],
+    "description": "Set the editor's work-area to a segment's frame range so the user can preview / scrub within it. Visible only in the timeline UI; does not change the underlying segment data. Use after `add_segment` if the user wants to immediately preview the new segment, or when they say 'jump to the intro segment'. Returns `{ segment_id, start_frame, end_frame }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_state_machines",
+    "params": [],
+    "description": "List the interactivity state machines defined in this file. Each one is `{ id, name, state_count, transition_count, is_active }`. Returns the active state machine id separately as `active_state_machine_id`. State machines are runtime configurations \u2014 Lottie players use them to switch playback based on events (click, hover, completion). Most files have 0 or 1 machine.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_state_machine",
+    "params": [
+      "name"
+    ],
+    "description": "Create a new interactivity state machine. The new (or reused) machine becomes the active one. After creating, add states with `add_state` and link them with `add_transition`. Designate one state as the entry point with `set_initial_state`. **Auto-reuse of empty default machines.** Creator files ship with an empty `StateMachine1`. If you call `add_state_machine` and one or more empty machines (zero states, inputs, and interactions) already exist, this tool reuses the first one \u2014 renaming it to your requested name \u2014 instead of creating a duplicate. The response includes `reused: true` and `previous_name` so you can mention it (e.g. \"I renamed the default empty machine to ...\"). Returns `{ state_machine_id, name, reused?, previous_name? }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_active_state_machine",
+    "params": [
+      "state_machine_id"
+    ],
+    "description": "Switch which state machine is active in the editor. Subsequent `add_state` / `add_transition` calls operate on this one. Returns `{ active_state_machine_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_state_machine",
+    "params": [
+      "state_machine_id"
+    ],
+    "description": "Delete an entire state machine and all its states / transitions / inputs / interactions. Returns `{ removed: true, state_machine_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_states",
+    "params": [],
+    "description": "List the states in the active state machine. Each is `{ id, name, type, segment, autoplay, loop, mode, is_initial, transitions: [{ id, to_state_id, trigger?, type }] }`. Returns `state_machine_id` and `initial_state_id` at the top level for convenience. Empty array means the active machine has no states yet.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_state",
+    "params": [
+      "name",
+      "segment",
+      "autoplay",
+      "loop",
+      "loop_count",
+      "mode",
+      "speed",
+      "must_complete"
+    ],
+    "description": "Add a new playback state to the active state machine. States represent a playback config \u2014 what segment plays, whether it loops, autoplay, etc. The state starts with no transitions; add them with `add_transition`. `segment` references a segment NAME from `list_segments` (not id). If the segment doesn't exist, the player will fail at runtime \u2014 call `list_segments` first to verify, or accept that the user might add the segment later. State names must be unique within a machine (case-insensitive \u2014 'Idle' and 'IDLE' collide). Returns `{ state_id, name, segment }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_global_state",
+    "params": [
+      "name"
+    ],
+    "description": "Add a GlobalState to the active state machine. Unlike regular states, a GlobalState's transitions are checked FIRST every tick, regardless of which state is currently active \u2014 so they fire from ANY state. Use this when the user says 'from any state when X, go to Y' or 'no matter where we are' or 'always allow Z'. Adding identical transitions to every regular state is the wrong shape \u2014 use GlobalState instead. **Constraints:** A GlobalState cannot have incoming transitions (the gateway rejects `add_transition` calls targeting one). Each machine can have at most ONE GlobalState \u2014 the gateway rejects a second. Convention names it 'GLOBAL STATE' (uppercase, with space). Returns `{ state_id, name, type: 'GlobalState' }`. Errors on missing active machine, duplicate name (case-insensitive), or attempting to add a second GlobalState.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_state",
+    "params": [
+      "state_id"
+    ],
+    "description": "Delete a state from the active state machine. Any transitions pointing TO this state are automatically removed. If the deleted state was the initial state, the machine loses its entry point \u2014 set a new initial state with `set_initial_state`. Returns `{ removed: true, state_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "update_state",
+    "params": [
+      "state_id",
+      "name",
+      "segment",
+      "autoplay",
+      "loop",
+      "loop_count",
+      "mode",
+      "speed",
+      "must_complete"
+    ],
+    "description": "Update fields on an existing state. Only the fields you pass are changed; everything else is preserved. Returns `{ state_id, ...updated_fields }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_state_actions",
+    "params": [
+      "state_id",
+      "entry_actions",
+      "exit_actions"
+    ],
+    "description": "Set entry and/or exit actions on a state. Entry actions fire when the state machine ENTERS the state; exit actions fire when LEAVING. Common uses: 'on enter set isPlaying = true, on leave set false', or 'on enter increment session counter'. Semantics: passing `entry_actions: [...]` REPLACES the existing entry array. Passing `entry_actions: []` clears it. OMITTING the field leaves the existing actions untouched \u2014 pass only the field you want to change. Actions follow the same 13-shape vocabulary as `add_pointer_interaction` (SetNumeric, SetBoolean, Toggle, Fire, SetTheme, etc.).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_initial_state",
+    "params": [
+      "state_id"
+    ],
+    "description": "Designate which state the machine enters first at runtime. Every state machine needs exactly one initial state. Returns `{ initial_state_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_transition",
+    "params": [
+      "from_state_id",
+      "to_state_id",
+      "trigger_event",
+      "type",
+      "duration_ms",
+      "easing",
+      "guards"
+    ],
+    "description": "Add a transition from one state to another in the active state machine. Transitions can fire immediately when the from-state's segment completes (no trigger), or in response to an event like 'click', 'pointerEnter', 'pointerExit' (pass `trigger_event`). **If you pass `trigger_event`, you MUST also call `add_pointer_interaction` with a matching `fire_event` \u2014 or the transition will never fire at runtime.** `trigger_event` is just a NAME the transition listens for; nothing emits that name until a pointer interaction is wired to fire it. A transition with `trigger_event: 'click'` and no matching `add_pointer_interaction({ pointer_event: 'Click', fire_event: 'click', layer_id })` looks correct in the panel but is dead at playback time. This is the #1 way to ship a broken state machine \u2014 always add BOTH calls when using `trigger_event`. The only exception: if a previous interaction in this state machine already fires the same event name, you can reuse it. Default `type: 'Transition'` is immediate. Pass `type: 'Tweened'` with `duration_ms` (number) + `easing` (cubic-bezier 4-tuple) for smooth interpolation between states. Tweened cannot target a GlobalState. Returns `{ transition_id, from_state_id, to_state_id, trigger_event, type }`. Errors if either state id is missing.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_transition",
+    "params": [
+      "state_id",
+      "transition_id"
+    ],
+    "description": "Remove a transition from a state. Returns `{ removed: true, transition_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_interactions",
+    "params": [],
+    "description": "List the interactions defined on the active state machine. Interactions BIND runtime pointer / state events to actions \u2014 usually a `Fire` action that emits a named event a transition listens for. **Without an interaction, transition `trigger_event` guards never fire.** If you added an `add_transition({ trigger_event: 'click' })`, you must also `add_pointer_interaction({ pointer_event: 'Click', fire_event: 'click' })` for the click to do anything at runtime. Returns `{ interactions: [{ id, type, layer_name, state_name, actions, fires_event }] }`. `type` is the pointer event name (Click / PointerEnter / \u2026) for pointer interactions OR `OnComplete` / `OnLoopComplete` for state-event interactions. `layer_name` is set for pointer interactions; `state_name` is set for state-event interactions. `actions[]` is the full action list in the agent-facing shape (snake_case + natural value types). `fires_event` is a legacy convenience: it's the input_name of the first `Fire` action when present, otherwise `null` \u2014 inspect `actions[]` for everything else.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_pointer_interaction",
+    "params": [
+      "pointer_event",
+      "fire_event",
+      "actions",
+      "layer_id"
+    ],
+    "description": "Bind a pointer event (Click, PointerEnter, etc.) on a layer to one or more state-machine actions. This is the wiring that makes `trigger_event` and input mutations actually fire at runtime. Two call shapes \u2014 pass EITHER `fire_event` (shorthand) OR `actions[]` (full vocabulary), never both: 1. `fire_event: 'click'` \u2014 shorthand for a single `Fire` action against the named event input. Pairs with `add_transition({ trigger_event: 'click' })`. Match exactly, case-sensitive. 2. `actions: [...]` \u2014 full action vocabulary. Each action targets an input by name or carries its own value. The 13 action types are: `SetNumeric`, `Increment`, `Decrement` (Numeric inputs); `SetString` (String); `SetBoolean`, `Toggle` (Boolean); `Fire`, `Reset` (Event / any input); `SetFrame`, `SetProgress`, `SetTheme`, `FireCustomEvent` (no input ref); `OpenUrl` (carries `url` + optional `target`). Multiple actions in one interaction fire in order. Action type must match input type (Increment requires Numeric, Toggle requires Boolean, etc.) \u2014 the gateway validates and errors clearly on mismatch. **Event input auto-create.** A `Fire` action (whether via `fire_event` shorthand or `actions: [{ type: 'Fire', input_name: 'X' }]`) needs an Event input named `X` to receive the fire \u2014 otherwise the fire vanishes and transitions listening for `X` never trigger. To keep this one-call, the gateway AUTO-CREATES any missing Event inputs referenced by Fire actions. The response includes an `auto_created_inputs` array when this happens, so you can surface it to the user (e.g. \"Created event input `click` and wired the click handler.\"). Returns `{ interaction_id, pointer_event, fire_event?, actions?, layer_id, layer_name, auto_created_inputs? }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_state_interaction",
+    "params": [
+      "trigger",
+      "state_id",
+      "actions"
+    ],
+    "description": "Add a state-event interaction that fires actions when a state's playback reaches a milestone. Use `OnComplete` for 'when this state's segment finishes' or `OnLoopComplete` for 'each time this state's segment loops'. Not to be confused with `add_transition`: a transition WITHOUT `trigger_event` also fires on segment completion, but it transitions to ANOTHER state. Use `add_state_interaction` when you want to fire actions (Fire, Increment, SetTheme, OpenUrl, etc.) on completion WITHOUT changing state. The action vocabulary is identical to `add_pointer_interaction.actions[]` \u2014 13 variants covering input mutations (SetNumeric, Increment, Toggle, \u2026), playback (SetFrame, SetProgress), theme (SetTheme), and side effects (OpenUrl, FireCustomEvent). Action type must match input type or the gateway errors clearly. **Event input auto-create.** Like `add_pointer_interaction`, this tool auto-creates any Event input referenced by a `Fire` action that doesn't yet exist on the active machine. The response includes `auto_created_inputs` when this happens. Returns `{ interaction_id, trigger, state_id, state_name, actions, auto_created_inputs? }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_interaction",
+    "params": [
+      "interaction_id"
+    ],
+    "description": "Remove an interaction from the active state machine. Returns `{ removed: true, interaction_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_inputs",
+    "params": [],
+    "description": "List the typed inputs (variables) on the active state machine. Inputs are how state machines store runtime values \u2014 booleans for toggle state, numerics for progress / counters, strings for labels, and events for one-shot triggers. Inputs feed guards on transitions and actions in interactions. Returns `{ inputs: [{ id, name, type, value? }] }`. The `value` is the initial value at machine start (events don't have one).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_input",
+    "params": [
+      "name",
+      "type",
+      "initial_value"
+    ],
+    "description": "Add a typed input variable to the active state machine. Inputs power guard transitions (e.g. transition fires when `isHovered === true`) and action targets (e.g. an action that sets `progress` to 50). Types: - `Boolean` \u2014 initial_value must be 'true' or 'false' (string). - `Numeric` \u2014 initial_value must be a stringified number. - `String` \u2014 initial_value is a plain string. - `Event` \u2014 pure one-shot trigger; do not pass initial_value. Returns `{ input_id, name, type }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "update_input",
+    "params": [
+      "input_id",
+      "name",
+      "value"
+    ],
+    "description": "Update an existing input's name or value. Renaming an input also updates all references to it across guards and actions automatically (theme-manager handles the cascade). Returns `{ input_id, name, value }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_input",
+    "params": [
+      "input_id"
+    ],
+    "description": "Delete an input. All guards / actions that reference it are also cleaned up automatically. Returns `{ removed: true, input_id }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "import_asset",
+    "params": [
+      "asset_type",
+      "content",
+      "url",
+      "name",
+      "position",
+      "scale"
+    ],
+    "description": "**BEFORE CALLING: check the creation order.** Imported assets are inserted at the TOP of the render stack. If this turn creates multiple layers, emit the calls in BOTTOM\u2192TOP order \u2014 the backdrop / sky / base image FIRST, foreground layers LAST. (Reorder APIs exist if needed via `reorder_layer`, but planning the order is cheaper.) Import an SVG, Lottie, or image into the active scene as a new layer. This is the preferred tool whenever the user pastes SVG markup, provides a URL for an image/Lottie, or asks to add an existing asset. Returns the new layer's id so you can immediately animate it with `apply_keyframes`. Provide either `content` (for inline SVG markup) or `url` (for Lottie JSON / image URLs). Optional `name`, `position`, and `scale` are applied after import.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "vectorize_image",
+    "params": [
+      "layer_id"
+    ],
+    "description": "Convert an existing PNG/JPG image layer into editable vector shape layers using Creator's vectorizer. Use this when the user asks to vectorize, trace, convert an image/logo/photo to vectors, or make an imported raster image editable. Defaults to the selected image layer when `layer_id` is omitted. The generated vector layers are inserted above the source and selected; after at least one vector layer is created, the original raster is preserved but hidden so it does not render or export twice. Restore it with `set_layer_visibility({ layer_id: source_layer_id, visible: true })` when the user wants to compare or revert.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_keyframes",
+    "params": [
+      "layer_id",
+      "property",
+      "frame_range"
+    ],
+    "description": "Remove keyframes from a single property on a single layer. Omit `frame_range` to clear all keyframes on that property; pass `frame_range: { from, to }` to remove only keyframes whose frame falls in the inclusive range. Use this before calling `apply_keyframes` with the same property when you want to fully replace an existing animation rather than merge with it \u2014 or just pass `clear_first: true` on `apply_keyframes` for the common case.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "duplicate_layer",
+    "params": [
+      "layer_id",
+      "count",
+      "stagger_frames",
+      "offset",
+      "name_prefix"
+    ],
+    "description": "Duplicate an existing layer N times and return the new layer IDs. Optional `stagger_frames` offsets each duplicate's timelineOffset by that many frames (i \u00d7 stagger) \u2014 use for stagger/wave effects. Optional `offset` shifts each duplicate's position by (i \u00d7 offset.x, i \u00d7 offset.y) \u2014 use for arrays and rows. Common flows: - 'make a row of 5 dots spaced 40px apart': duplicate_layer with count=4 (+ the source = 5 total) and offset={x:40,y:0}, then a single apply_keyframes call on the source animates the base motion. - 'stagger 5 letters': duplicate_layer with count=4 and stagger_frames=3; each clone gets timelineOffset = source + i*3. - **2-D grid (rows \u00d7 cols)**: call duplicate_layer once per row \u2014 first call with count=cols-1 and offset={x:tile,y:0} (top row), then for each additional row, call with count=cols-1 on ONE of the top-row tiles and offset={x:0,y:tile}. Or simpler: N serialized calls, one per row, each duplicating a source tile with x-offsets. Do NOT attempt a 2-D grid with a single duplicate_layer call \u2014 `offset` is 1-D. Returns an array of `{ layer_id, name }` for the new layers, in creation order. Capped at 24 copies per call.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "tile_layer",
+    "params": [
+      "layer_id",
+      "cols",
+      "rows",
+      "tile_width",
+      "tile_height",
+      "gap",
+      "margin",
+      "alternate_flip"
+    ],
+    "description": "Fill the active scene with a grid of copies of a layer. This is the tool to reach for whenever the user says 'tile across the scene', 'fill with a grid of', 'cover with', 'scatter N', or 'pattern the background with'. It ALWAYS uses `Math.floor` for auto cols/rows so tiles never spill outside the scene bounds. Behavior: - `tile_width` / `tile_height` default to the source layer's visual bounds (read via getBounds). For a polygon with outerRadius 50, that's ~100\u00d7100. - `cols` / `rows` default to `floor((scene_dim \u2212 2*margin + gap) / (tile_dim + gap))` so the grid exactly fits. Pass either explicitly to override. - Grid is centered inside the `margin`-inset scene rect. - Optional `gap` between tiles (default 0). - Optional `margin` (default 0) to inset the grid from scene edges. - Optional `alternate_flip: true` rotates odd rows by 180\u00b0 \u2014 ideal for triangle tessellation. - Reuses the source layer as cell (0,0); only cols\u00d7rows\u22121 new layers are created. - Hard cap of 144 tiles (12\u00d712) to keep Creator responsive. Throws if exceeded. Example: 'tile this triangle to fill the scene' \u2192 one call, no params beyond layer_id. For a 512\u00d7512 scene with a 100px triangle: fills as 5\u00d75 with the grid centered.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "reorder_layer",
+    "params": [
+      "layer_id",
+      "sibling_layer_id",
+      "position"
+    ],
+    "description": "Restack a layer relative to another in the active scene's render order. Use when creation order was wrong or the user asks to put one layer above/below/in-front-of/behind another. Z-ORDER (index 0 = front/top, per read_scene `ordering`): - To put the layer ON TOP of the sibling (visible in front \u2014 e.g. a label over a button fill, text over a circle): `position: 'in_front_of'`. - To put the layer UNDER the sibling (behind \u2014 e.g. a shadow behind a card, a backdrop behind content): `position: 'behind'`. USE `in_front_of` / `behind` \u2014 they say exactly what you mean. The legacy `before` / `after` refer to render-ARRAY position and invert intuitively (`before` the sibling = drawn after it = renders ON TOP); only use them if you're certain. \"bring to front\" = `in_front_of` the current front layer; \"send to back\" = `behind` the current back layer. Pass `layer_id` (the layer to move), `sibling_layer_id` (stays put), `position`. The canvas re-renders after the move \u2014 verify with `inspect_scene` and check the target isn't `occlusion.likely_hidden`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "group_layers",
+    "params": [
+      "layer_ids",
+      "name"
+    ],
+    "description": "Group multiple active-scene root layers by converting them into a nestable precomposition layer. Creator's native shape-group command only groups drawable shapes inside a shape layer, so root-level layer grouping is represented as a precomp. Use this when the user asks to group several layers, package a component, or create a reusable/nestable precomp from existing layers. Pass layer IDs from `read_scene` in the intended visual set.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_shape_group",
+    "params": [
+      "parent_id",
+      "name"
+    ],
+    "description": "Create an empty group inside an existing SHAPE_LAYER or group. Use this to build composed single-layer components like cards, icons, badges, and shadows without creating many top-level layers. **RESPONSE \u2014 keep `group_id`, it is the only way to address the group afterwards:** returns `{ group_id, parent_id, name }`. `read_scene` returns LAYERS, not the shape/group tree inside them, so this response is your only source of the id. Feed `group_id` straight into `add_shape_to_layer({ parent_id: group_id })` to fill the group and into `set_group_transform({ group_id })` to move / fade the whole group as one unit.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "add_shape_to_layer",
+    "params": [
+      "parent_id",
+      "shape",
+      "size",
+      "points",
+      "outer_radius",
+      "inner_radius",
+      "roundness",
+      "outer_roundness",
+      "inner_roundness",
+      "path",
+      "fill",
+      "stroke",
+      "name"
+    ],
+    "description": "Add a rectangle, ellipse, polygon, star, or path to an existing SHAPE_LAYER or group. Use with create_shape_group to build one composed unit with internal groups. **RESPONSE:** returns `{ parent_id, shape_id, shape, fill_id, stroke_id }` (`fill_id` / `stroke_id` only when you passed `fill` / `stroke`). Keep `shape_id` \u2014 it is the `target_id` for `animate_property` on shape geometry (`shape_size`, `rectangle_roundness`, `shape_path`, \u2026), and `read_scene` does not list the shapes inside a layer. If the fill or stroke fails to attach, the whole call is rolled back (the shape is removed) and it throws, so a successful response means every requested piece exists.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_group_transform",
+    "params": [
+      "group_id",
+      "property",
+      "value",
+      "clear_first",
+      "keyframes"
+    ],
+    "description": "Set or keyframe a shape group transform/opacity property. Use this when a composed unit has internal groups that should move or fade together. Pass EITHER `value` (a static set) OR `keyframes` (an animation) \u2014 the call throws if you pass neither. `keyframes` wins when both are given. Returns `{ group_id, property, keyframes_added }`; `keyframes_added` is 0 for a static `value` set.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "reorder_shape",
+    "params": [
+      "node_id",
+      "sibling_id",
+      "position"
+    ],
+    "description": "Restack a child shape or group relative to a sibling inside the same shape container \u2014 to fix internal card/icon order without rebuilding the layer. Z-order: `position: 'in_front_of'` draws the node ON TOP of the sibling, `'behind'` draws it under. Use `in_front_of`/`behind` (clear); `before`/`after` are legacy aliases that invert intuitively (`before` = on top).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_layer_time",
+    "params": [
+      "layer_id",
+      "start_frame",
+      "end_frame",
+      "timeline_offset"
+    ],
+    "description": "Retime an existing layer on the timeline. Any combination of start_frame, end_frame, and timeline_offset can be set \u2014 omitted values stay as-is. - `start_frame` / `end_frame`: when the layer is visible in the parent scene. - `timeline_offset`: how far the layer's internal timeline is shifted (negative = play later). This is the stagger primitive \u2014 give each sibling a different offset. Prefer this over `apply_keyframes` on opacity when the user asks to 'delay' or 'stagger' layers \u2014 this is cheaper, correct, and doesn't collide with existing opacity animations.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "retime_keyframes",
+    "params": [
+      "layer_id",
+      "property",
+      "operation",
+      "offset",
+      "scale",
+      "start_frame",
+      "end_frame",
+      "easing"
+    ],
+    "description": "Shift, scale, reverse, evenly distribute, or RE-EASE keyframes on one layer property WITHOUT rebuilding values. Use for timing/feel polish like \"shift this 10 frames later\", \"make the bounce twice as fast\", or \"make it springier\". **To change the EASING / feel (springy, snappy, smoother, bouncy, more/less overshoot) use `operation: 'set_easing'` with `easing` \u2014 NOT apply_keyframes.** set_easing swaps only the easing curve and preserves every frame and value. Rewriting the animation via apply_keyframes forces you to restate all values and risks corrupting positions (e.g. collapsing a staggered word onto itself). For a multi-layer cascade (split-text letters, card grid), call set_easing once PER layer \u2014 each call is value-safe, so the layout cannot drift. **Every operation reads the property's CURRENT keyframes, rewrites their frames, and puts the same values back \u2014 values are never touched by any operation.** The tool throws if the property has no keyframes yet (use `apply_keyframes` to create them first). `operation`, and the parameters each one reads (all others are ignored): - **`shift_frames`** \u2014 moves every keyframe by `offset` frames. Positive = LATER, negative = EARLIER. \"shift this 10 frames later\" = `{ operation: 'shift_frames', offset: 10 }`. **`offset` defaults to 0, so `{ operation: 'shift_frames' }` with no `offset` is schema-valid and does nothing** \u2014 always pass it. Frames are clamped at 0, so shifting earlier past the start piles those keyframes onto frame 0 and flattens that part of the motion; check the returned `frames`. - **`scale_time`** \u2014 multiplies each keyframe's DISTANCE FROM THE ORIGIN by `scale`: `new = origin + (old - origin) * scale`. The origin is `start_frame` if given, otherwise the property's FIRST keyframe. `scale` must be greater than 0; zero and negative values are rejected before any keyframes change. `scale < 1` = faster/shorter, `scale > 1` = slower/longer. \"make the bounce twice as fast\" = `{ operation: 'scale_time', scale: 0.5 }`; \"twice as slow\" = `scale: 2`. `scale` defaults to 1 (no-op) \u2014 always pass it. The result is NOT rounded, so a scale that does not divide the spans evenly leaves keyframes on fractional frames (frame 7 \u00d7 0.5 = 3.5); prefer factors that land on whole frames. - **`reverse`** \u2014 mirrors the frames inside a window: `new = start + end - old`, so the motion plays backwards while keeping the same span. The window defaults to the property's first\u2192last keyframe; pass `start_frame`/`end_frame` to mirror inside a different window. - **`distribute_evenly`** \u2014 respaces the EXISTING keyframes at equal intervals between `start_frame` and `end_frame` (defaults: first\u2192last keyframe), keeping their order and values. Use it to kill uneven timing (\"even out the spacing\", \"make the steps regular\"). It does not add or remove keyframes. - **`set_easing`** \u2014 replaces the easing curve on every keyframe of the property; frames and values are untouched. Requires `easing` (the call throws without it). **RESPONSE:** returns `{ layer_id, property, operation, retimed, frames }`. `retimed` is how many keyframes were rewritten (unchanged from before \u2014 this operation never adds or drops keyframes) and `frames` is the full new frame list, sorted. **Check `frames` before saying done:** repeated values mean keyframes collided (clamping at 0, or a `scale` small enough to merge them) and that stretch of the animation is now flat.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "delete_layer",
+    "params": [
+      "layer_id"
+    ],
+    "description": "Remove ONE layer from the scene by id. If the scene digest selection is non-empty and the user says 'delete this', 'remove it', 'delete selected', etc., use the selected layer id(s) with this tool. For multiple selected layers, call this tool once per selected id. Returns `{ layer_id, removed: true }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_mask",
+    "params": [
+      "layer_id",
+      "shape",
+      "rect",
+      "ellipse",
+      "path",
+      "mode",
+      "opacity"
+    ],
+    "description": "Add a mask to a layer. Masks clip the layer's visible content to an arbitrary shape \u2014 use for reveal wipes ('reveal from left'), clipping images/Lotties to a shape ('mask this image to a circle'), and any 'show only the part inside' request. For the common shapes, pass one of the shorthands: - `shape: \"rectangle\"` + `rect: { x, y, width, height }` \u2014 axis-aligned rectangle in LAYER-local coordinates. - `shape: \"ellipse\"` + `ellipse: { cx, cy, width, height }` \u2014 center-defined ellipse, width/height being the bounding box. Plugin synthesizes a 4-point cubic bezier approximation (standard kappa constant). - `shape: \"path\"` + `path: { points: [{vertex:{x,y}, inTan:{x,y}, outTan:{x,y}}...], closed: boolean }` \u2014 raw PathData for complex shapes. Coords are LAYER-LOCAL \u2014 a rect at (0, 0, 100, 100) covers the top-left 100\u00d7100 of the layer's content, regardless of where the layer sits in the scene. Optional `mode` defaults to 'add' (show only inside the mask). Pass 'subtract' to cut a hole. Optional `opacity` (0\u2013100) controls mask opacity; it is not an enable/disable strength. For an ADD mask, opacity 0 makes the masked layer fully transparent and 100 shows the content inside the outline. For a SUBTRACT mask, opacity 0 cuts nothing and 100 fully cuts inside the outline. Use `remove_mask` to restore unmasked rendering. **RESPONSE \u2014 this is the ONLY source of a mask id:** returns `{ layer_id, mask_id, shape, mode, opacity }`. `read_scene` does NOT list masks or mask ids, so if you need to address a specific mask later, keep `mask_id` from this response. Everything that takes a mask id also has a first-mask fallback, so a lost id is recoverable on single-mask layers: `update_mask` / `remove_mask` act on the FIRST mask when `mask_id` is omitted, and `animate_property` targets the first mask when both `target_id` and `target_index` are omitted. Animate mask opacity/path with `animate_property({ layer_id, property: 'mask_opacity' | 'mask_path', ... })` \u2014 pass `target_id: mask_id` (or `target_index`) only when the layer has MORE THAN ONE mask; otherwise omit both and it uses the first one. `apply_keyframes` targets layer properties only and cannot reach masks. Note `mask_path` keyframe values are whole PathData objects (`{ points: [...], closed }`), not a width \u2014 build the full path for each keyframe. Common recipes: - 'reveal from left': rectangle mask at (0, 0, 0, layerH), then animate `mask_path` from a zero-width rect to a full-width one with `animate_property`. - 'circle clip': ellipse mask, cx/cy = layer center, width/height = desired diameter. - 'oval-vignette': ellipse mask slightly inset from layer bounds, opacity 0 \u2192 100 animated with `animate_property` on `mask_opacity`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "update_mask",
+    "params": [
+      "layer_id",
+      "mask_id",
+      "path",
+      "opacity",
+      "mode"
+    ],
+    "description": "Update an existing mask path, opacity, or mode. Use after create_mask when the reveal shape needs tuning without recreating the mask. Only the fields you pass change; omitted fields are left alone. Returns `{ layer_id, mask_id, updated: { path, opacity, mode } }` \u2014 each `updated` flag reports whether that field was part of this call.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_mask",
+    "params": [
+      "layer_id",
+      "mask_id"
+    ],
+    "description": "Remove one mask from a layer. Pass mask_id when known; otherwise removes the first mask only. Returns `{ layer_id, mask_id, removed: true }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_matte",
+    "params": [
+      "layer_id",
+      "matte_layer_id",
+      "inverted"
+    ],
+    "description": "Apply a track/alpha matte: use another layer's alpha/shape as the visibility matte for this layer. This is THE premium-reveal primitive \u2014 what AE calls 'Alpha Matte'. Typical flow: 1. User has (or you create) the layer to be revealed (the logo, image, text). 2. User has (or you create) a second layer whose shape defines the reveal region (a growing circle, a wipe rectangle, a word-shaped text layer). 3. Call `set_matte({ layer_id: target, matte_layer_id: matteSource })`. The native tool sets `matteSource.isMatte = true` so the matte layer itself becomes invisible in the render while still defining the reveal region. Animate the matte source (position, scale, trim path, etc.) and the target layer is revealed accordingly. Pass `inverted: true` to show the target OUTSIDE the matte shape instead of inside (inverted alpha matte). Common recipes: - 'reveal logo through a growing circle': create ellipse shape \u2192 set_matte with matte_layer_id = circle \u2192 apply_keyframes on circle.scale 0 \u2192 100. - 'text appears through a gradient sweep': create rectangle \u2192 set_matte \u2192 animate rectangle x across the text width. - 'punch a hole': set_matte with inverted: true.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "remove_matte",
+    "params": [
+      "layer_id"
+    ],
+    "description": "Clear the track matte from a layer.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "rename_node",
+    "params": [
+      "node_id",
+      "name"
+    ],
+    "description": "Rename a layer, shape, group, mask, or scene node by id. Use for cleanup and making generated structures understandable.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_layer_visibility",
+    "params": [
+      "layer_id",
+      "visible"
+    ],
+    "description": "Show or hide one active-scene layer.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_layer_lock",
+    "params": [
+      "layer_id",
+      "locked"
+    ],
+    "description": "Lock or unlock one active-scene layer.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "flip_layer",
+    "params": [
+      "layer_id",
+      "direction"
+    ],
+    "description": "Mirror a layer horizontally or vertically. Wraps `layer.flip(direction)`. Use for 'mirror this', 'flip horizontally', 'face the other way'. Works on any layer type.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "align_layer",
+    "params": [
+      "layer_id",
+      "direction"
+    ],
+    "description": "**Use this as your first choice for centering or aligning layers to the scene.** Wraps Creator's own alignment math \u2014 the exact same path the property-panel 'align center' / 'align left' / 'align top' buttons run. Works reliably across text, shape, and image layers. `horizontal-center` aligns the layer's visual bounds to the scene's horizontal midpoint; `vertical-center` to the vertical midpoint. For a fully-centered layer, emit BOTH in order: one tool call with `direction: 'horizontal-center'` and then one with `direction: 'vertical-center'`. Same for 'top-left' \u2192 `top` + `left`, and so on. **Prefer this over `center_layer({ target })` unless you need to land on a NON-scene-center point** (e.g. a callout at (180, 380)). For brand-new centered text, prefer `create_text({ center_in_scene: true })` \u2014 that's even fewer calls. **RESPONSE:** returns `visual_center`, `visual_bounds`, and `scene_fit`. For text layers, `position` is intentionally omitted \u2014 `visual_center` is the only placement coordinate that matters.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "align_layers",
+    "params": [
+      "layer_ids",
+      "edge",
+      "to"
+    ],
+    "description": "Align a SET of existing layers to a shared edge derived from the set itself \u2014 the multi-layer counterpart of `align_layer` (which only aligns ONE layer to a SCENE edge). Use this to FIX a row/column you (or the user) hand-placed that came out ragged or misaligned: e.g. make a column of labels share a LEFT edge, or a row of icons share a TOP edge. `edge`: which edge to make flush \u2014 `left`/`right`/`horizontal-center` (x-axis) or `top`/`bottom`/`vertical-center` (y-axis). Edge-anchored by each layer's RENDERED visual bounds (so text aligns by its real left/right edge, not its baseline anchor). `to` (optional): the coordinate to align to \u2014 `min` (leftmost/topmost; default for left/top), `max` (default for right/bottom), `mean` (default for centers), `first` (the first layer's edge), or an explicit number. Guards: refuses layers with ANIMATED position (all-or-nothing) \u2014 align BEFORE animating, then `stagger_layers`. Returns `{ aligned, edge, axis, value, layer_ids }`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "layout",
+    "params": [
+      "type",
+      "items",
+      "layer_ids",
+      "gap",
+      "align",
+      "origin",
+      "group",
+      "name",
+      "background"
+    ],
+    "description": "Lay out multiple items in a ROW or COLUMN with EVEN spacing and shared-edge alignment \u2014 in ONE call. **Use this instead of hand-placing positions** for any multi-item arrangement: nav menus, button rows, lists, label stacks, feature rows, and especially LEGENDS / swatch grids / spec-sheet rows / icon lists (a swatch legend = a column of `{swatch, label}` row-blocks \u2014 hand-placing those overlaps the label onto the swatch). It creates the items (or arranges existing layers), measures each rendered size, and computes even gaps + alignment so the result is correct by construction \u2014 no pixel math, no uneven gaps, no ragged edges. `type`: `row` (horizontal) or `column` (vertical). Provide EITHER `items` (to create text/shapes) OR `layer_ids` (to arrange existing layers) \u2014 not both. `gap` (default 24): the SINGLE even gap between items. `align` (cross-axis, default `center`): `start` = shared leading edge (left for a column, top for a row \u2014 this is how you get a left-aligned list), `center`, `end`. `origin` (default `scene-center`): where the whole block centers \u2014 `scene-center` / `top-center` / `bottom-center` / `{x,y}`. Item kinds: `{ kind: 'text', text, font_size?, fill_color?, font_variant? }`, `{ kind: 'shape', shape, size, fill_color?, roundness?, points?, outer_radius?, inner_radius?, stroke? }`, `{ kind: 'layer', layer_id }`, or a NESTED `{ kind: 'block', type:'row'|'column', items:[\u2026], gap?, align?, group? }` \u2014 a sub-layout the parent treats as one unit. Use a block to compose multi-row/column layouts in ONE call: e.g. a vertical list of icon+label rows where the icons all share a left edge and the labels all share another \u2192 `layout({ type:'column', align:'start', gap:24, items:[ { kind:'block', type:'row', align:'center', gap:16, items:[{kind:'shape',shape:'ellipse',size:{width:32,height:32}},{kind:'text',text:'Create account'}] }, { kind:'block', type:'row', align:'center', gap:16, items:[\u2026'Verify email'] }, { kind:'block', type:'row', align:'center', gap:16, items:[\u2026'Invite your team'] } ]})`. The outer `column align:'start'` flushes each row-block's left edge, so all circles land on one x and all labels on another \u2014 no follow-up `align_layers`. A nested block takes `items` only (no `origin`/`layer_ids`); `group:true` on a block makes it one animatable precomp. Max nesting depth 3. **Cards:** add `background:{ fill, roundness?, padding?, stroke?, shadow? }` to a block to drop a rounded panel sized to its content + padding BEHIND it \u2014 so a card = panel + content builds in ONE call (never create the content then bolt a panel on top). **`background` works on a block that CREATES its `items`, OR on the top-level `layout` call itself (it wraps the whole layout in one card panel)** \u2014 so build the card's content INSIDE the block (`items:[\u2026]`), do NOT pre-create the text/shapes and then arrange them by `layer_ids` and try to wrap them. If you catch yourself doing `create_shape` (panel) + `reorder_layer` (behind) + `add_drop_shadow` around already-made content, STOP \u2014 that's the legacy bolt-on this `background` replaces; rebuild the content as `items` inside the block instead. With `group:true` the whole card becomes one animatable precomp you can slide/scale/fade as a unit. `fill` is required (use `fill:'none'` with a `stroke` for an outlined card); `padding` defaults to 24. E.g. a feature card: `{ kind:'block', type:'column', align:'center', gap:12, group:true, background:{ fill:{r:248,g:250,b:252}, roundness:16, padding:24, shadow:{} }, items:[ {kind:'shape',shape:'ellipse',size:{width:48,height:48}}, {kind:'text',text:'Fast'} ] }`. Returns `items` (each with `layer_id`, `visual_center`, `visual_bounds`; a block item also has `kind:'block'` + `child_layer_ids`), `cascade_order` (flattened reading order of staggerable root layers \u2014 pass straight to `stagger_layers`), `evenness` (`main_gaps`, `uniform`), and `content_bounds`. Examples: a left-aligned nav = `layout({ type:'column', align:'start', items:[{kind:'text',text:'Home'},\u2026] })`; a feature row = `layout({ type:'row', align:'center', items:[{kind:'shape',shape:'ellipse',size:{width:40,height:40}},{kind:'text',text:'Fast'}] })`.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "read_keyframes",
+    "params": [
+      "layer_id",
+      "property"
+    ],
+    "description": "Read the current keyframes on a layer's keyframe-tool properties. Use this whenever the user asks to TUNE, POLISH, or MODIFY an existing animation ('make the bounce snappier', 'slow down the fade', 'shift this 10 frames later', 'make the rotation smoother') \u2014 so you can see what's actually there before changing it, instead of rebuilding from scratch. Without `property`, returns a map of the core properties handled by `apply_keyframes` (`position`, `scale`, `rotation`, `opacity`, `fill_color`, trim path fields, and `stroke_width`). With `property`, returns just that explicit core or extended property. Extended properties such as masks, shape paths, gradients, text animator fields, and time mapping must be named explicitly; they are not included in the bulk read. For static (non-animated) properties, `is_animated` is false and `static_value` is returned instead of keyframes. **For `position` on a TEXT layer, `static_value` is the RAW transform (baseline / box-origin anchor) \u2014 NOT the visual center. To animate a text position relative to its rest (the only safe way), keyframe from THIS `static_value`, not from `visual_center`. For a settle-into-place entrance, prefer `animate_entrance`, which reads this for you.** Easing in returned keyframes comes through as the raw stored shape: `{ type: \"LINEAR\" }` or `{ type: \"CUBIC_BEZIER\", x1, y1, x2, y2 }`. (Named presets are expanded at write-time, so reads only see the resolved bezier coefficients.)",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "copy_animation",
+    "params": [
+      "source_layer_id",
+      "target_layer_id",
+      "properties",
+      "frame_offset",
+      "clear_first_on_target"
+    ],
+    "description": "Copy keyframes from one layer's core keyframe-tool properties onto another. The classic use: 'match this layer's animation to the others,' 'copy the rotation from the big triangle to the small one,' 'give this the same entrance as that one.' By default, animated core properties from `apply_keyframes` are copied \u2014 pass `properties` to restrict. Extended `animate_property` fields such as masks, shape paths, gradients, text animator fields, and time mapping are not copied by this tool. Pass `frame_offset` to shift all copied keyframes by N frames, which stacks with this tool for manual staggers (e.g. call copy_animation for each sibling with a different offset). `clear_first_on_target` (default true) replaces any existing keyframes on the target's matching property; pass false to merge. Properties that don't exist on the target layer type (e.g., `fill_color` on a text layer) are skipped with a note in the response rather than erroring the whole call.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "list_scenes",
+    "params": [],
+    "description": "List every scene in the current project plus which one is active. Cheap read. Use when the user refers to scenes by name ('switch to the outro', 'work on the vertical') so you can find the right `scene_id`, or when deciding whether to create a new scene vs. switch to an existing one. Returns active scene id, and for each scene: id, name, size, framerate, duration, layer_count, and is_nestable (whether the scene can be used as a source for a nested scene layer).",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_scene",
+    "params": [
+      "name",
+      "size",
+      "framerate",
+      "duration",
+      "activate"
+    ],
+    "description": "Create a new scene (a.k.a. composition / artboard) in the project. Use for 'make a vertical variant', 'add a second scene for the outro', 'new 1080\u00d71920 version', 'start fresh on a new composition'. All fields optional \u2014 omit to inherit defaults. If size is omitted, Creator uses its default (typically 1920\u00d71080). Provide explicit size when the user asks for a specific aspect ratio (9:16 \u2192 1080\u00d71920, 1:1 \u2192 1080\u00d71080, etc.). **IMPORTANT**: `activate` defaults to true, meaning the newly created scene becomes the active scene. Any layer IDs you had from before (in history or from a recent read_scene) are INVALID in the new active scene \u2014 they belong to the previous scene. Call `read_scene` immediately after this tool before using any layer-targeting tool. If the user wants a new scene without switching, pass `activate: false` and the current scene stays active.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "switch_scene",
+    "params": [
+      "scene_id",
+      "name"
+    ],
+    "description": "Switch Creator's active scene. Provide either `scene_id` (exact) or `name` (exact or case-insensitive substring match across scenes). Use `list_scenes` first if you're not sure what's available. **IMPORTANT**: After this tool runs, any layer_id from prior turns is INVALID \u2014 those layers live in the scene you just switched away from. Call `read_scene` before using any layer-targeting tool on the new active scene. If you switched temporarily into a selected precomp/source scene, switch back to the original active scene before ending the turn.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_current_frame",
+    "params": [
+      "frame",
+      "add_to_history"
+    ],
+    "description": "Move the active scene's playhead to a specific frame. Use this after creating reveal/draw-on/fade-in animations where frame 0 is intentionally invisible (`trim_end: 0`, opacity 0, offscreen position) so the Creator canvas is left on a representative visible frame. This changes the editor preview frame only; it does not add animation keyframes or alter layer timing.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_scene_background",
+    "params": [
+      "color"
+    ],
+    "description": "Set the PREVIEW background color of the active scene. **This is preview-only \u2014 the color is NOT exported with the final animation; exports always have a transparent background.** Use this whenever you want to see how the design reads against a specific surface (e.g. dark mode preview, brand tint preview, contrast check for white-on-X) WITHOUT polluting the scene with a background rectangle layer. **Strongly prefer this over creating a background SHAPE LAYER.** Motion-design convention: animations float on transparency so they can be composited anywhere. Adding a background rectangle layer adds noise, exports unwanted color, and forces the user to delete it if they want to use the animation on a different surface. The only reasons to add a real background SHAPE LAYER are: (1) a gradient or multi-stop background that's part of the design, (2) a contrast issue that can't be solved any other way, (3) the user EXPLICITLY says 'add a background layer' or similar. For every other case (the user says 'on a dark background', 'against a navy backdrop', 'preview on cream', etc.) use this tool \u2014 it changes the scene's preview color, leaves the final animation transparent. **REQUIRED, not optional:** when the scene has no background AND you place near-white (luminance > 0.5, e.g. #f8fafc / #ffffff) full-bleed text or fills, you MUST call this in the SAME turn with a dark color (Slate-900 {r:15,g:23,b:42}) \u2014 the default preview is white and light text would be invisible. Button labels on a dark button fill are self-contained and do NOT trigger this; only full-bleed text on the canvas does.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "set_scene_settings",
+    "params": [
+      "size",
+      "framerate",
+      "duration",
+      "origin_point"
+    ],
+    "description": "Update the active scene size, framerate, duration, and/or origin point. Use for prompts like \"make this 1080x1920\", \"make it 60fps\", or \"extend to 8 seconds\".",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "create_scene_layer",
+    "params": [
+      "source_scene_id",
+      "source_scene_name",
+      "name",
+      "position",
+      "opacity",
+      "scale",
+      "start_frame",
+      "end_frame"
+    ],
+    "description": "Place an existing NESTABLE scene/precomp into the active scene as a SceneLayer (nested composition / component / precomp). Use this for professional card, panel, logo, or UI units only when `list_scenes` reports the source scene has `is_nestable: true`. Important: newly created top-level scenes that report `is_nestable: false`; those cannot be used as scene-layer sources. Do not create a fresh scene and immediately try to place it unless `list_scenes` confirms it is nestable. For generated cards/panels, prefer a single grouped ShapeLayer when no nestable source exists. Provide `source_scene_id` from `list_scenes`, or `source_scene_name` if unique. The layer is created in the current active scene. The source scene cannot be the current active scene \u2014 switch to the parent scene first. After creation, animate the returned `layer_id` like any other layer, and apply `set_matte` to this one layer for viewport clipping.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "break_scene_layer",
+    "params": [
+      "layer_id"
+    ],
+    "description": "Destructively break an active-scene scene/precomp layer into independent editable layers. Use only when the user explicitly asks to break apart, detach, ungroup, or extract a nested scene. Do not use for normal edits to a precomp/scene layer contents; switch to the source scene and edit there instead.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "export_lottie",
+    "params": [],
+    "description": "Export the active scene as Lottie JSON for debugging. Result content is redacted in audit logs but returned to the tool caller.",
+    "exposed_via_local_mcp": false
+  },
+  {
+    "group": "gateway",
+    "name": "apply_bounce",
+    "params": [
+      "layer_id",
+      "axis",
+      "from",
+      "to",
+      "elasticity",
+      "gravity",
+      "max_bounces",
+      "start_frame",
+      "clear_first"
+    ],
+    "description": "Drop or lift a layer with physics-correct bounce keyframes. **Use this for any prompt mentioning bounce / drop / fall / land / gravity**. Computes a parametric trajectory: each successive bounce decays in BOTH amplitude and duration, which is the part hand-tuned bounces always miss (uniform-timing decay reads as wrong). **Position-only by design.** Squash-and-stretch is a separate concern \u2014 call `apply_squash` afterward if the user explicitly asked for a 'playful' / 'cartoon' / 'springy' bounce. A bare 'bounce' should not deform the layer's scale. Defaults pick a 'snappy but natural' bounce. Tune `elasticity` and `gravity` for feel: - elasticity 0.4 (stiff, settles fast) \u2192 0.85 (cartoony, lots of bounces) - gravity 1500 (floaty) \u2192 12000 (heavy) - max_bounces 4 is visible; >6 is sub-pixel Returns the impact frame numbers in the response under `impact_frames`. These frames are non-uniform (each bounce decays in BOTH amplitude and duration). Any follow-up tool that targets impacts \u2014 `apply_squash`, `apply_coupled_shadow` \u2014 **must consume this exact array from the response**. Do NOT estimate, do NOT recompute from elasticity/gravity, do NOT call those tools in parallel with `apply_bounce` (they need the response in scope). Sequence: `apply_bounce` \u2192 read response \u2192 `apply_squash` / `apply_coupled_shadow` with `impact_frames` from that response.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "apply_squash",
+    "params": [
+      "layer_id",
+      "impact_frames",
+      "ratio",
+      "decay_per_impact",
+      "min_spacing_frames",
+      "clear_first"
+    ],
+    "description": "Add squash-and-stretch scale keyframes at specified impact frames. **Only call this when the user explicitly asks for 'playful' / 'cartoon' / 'springy' / 'squashy' / 'with squash and stretch' on top of a bounce.** A bare 'bounce' should NOT include squash \u2014 leave the layer's scale untouched. **CRITICAL \u2014 `impact_frames` MUST be the literal array returned by `apply_bounce`'s response. NEVER invent them, NEVER estimate them, NEVER guess at multiples of a frame number.** This tool is SEQUENTIALLY DEPENDENT on `apply_bounce`: emit `apply_bounce` first, READ its response's `impact_frames` array, then pass that exact array into this tool's `impact_frames` parameter. Do not emit both calls in parallel \u2014 `apply_squash` is meaningless without the bounce response in scope. The failure mode if you invent frames: squash fires AFTER the ball has already come to rest (impact frames must land exactly on the bounce arcs, which are non-uniform because each bounce decays in BOTH amplitude and duration \u2014 you cannot derive them from elasticity/gravity by hand). Given the impact frames (always from `apply_bounce`'s response), emits a 5-keyframe envelope per impact: anticipation stretch (taller, narrower) \u2192 squash at impact (wider, shorter) \u2192 rebound stretch \u2192 settle. Decays the squash strength on successive impacts so the squash fades out as the bounce dies. The scale.x/scale.y inversion is built in (squash widens X, narrows Y). Don't try to add this manually with apply_keyframes \u2014 the timing windows have to align with the bounce arcs or the squash flickers between bounces.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "gateway",
+    "name": "apply_coupled_shadow",
+    "params": [
+      "ball_layer_id",
+      "shadow_layer_id",
+      "width_ratio_at_impact",
+      "width_ratio_at_apex",
+      "flatness",
+      "opacity_at_impact",
+      "opacity_at_apex",
+      "clear_first"
+    ],
+    "description": "Animate an existing shadow layer to track a bouncing object. **Always use this for shadows under bouncing balls** \u2014 it solves all five shadow bugs (A: position pinned at ball center, B: shadow wider than object, C: inverted scale direction, D: copying ball.scale onto shadow, E: redundant static keyframes) by computing every value from the ball's existing position keyframes via the rule: `shadow.position.y = ball.y_at_rest + ball_radius` (CENTER, not top) `shadow.scale.x = widthRatio \u00d7 ball_diameter` (interpolates between apex and impact ratios; flat `scale.y`) `shadow.opacity = inverse of altitude` (impact = brightest, apex = faintest) **Two-layer stacked-solid fill.** A single solid black ellipse reads as a sticker; a radial-gradient ellipse currently can't export with per-stop alpha. Create TWO shadow ellipses (both circular at natural size, same dark slate solid fill `{r:15, g:23, b:42}`) and call `apply_coupled_shadow` once on each: an Outer 'Shadow Edge' layer (`width_ratio_at_impact: 1.35, width_ratio_at_apex: 0.6, opacity_at_impact: 0.30, opacity_at_apex: 0.10`) and an Inner 'Shadow Core' layer (`width_ratio_at_impact: 0.9, width_ratio_at_apex: 0.4, opacity_at_impact: 0.65, opacity_at_apex: 0.25`). Create the Outer FIRST so the Inner (created LAST) lands on TOP of it (Creator inserts new layers at the top of the stack). **REQUIRED FOLLOW-UPS \u2014 do not skip:** 1. Call `add_blur` on EACH shadow layer to soften the edge. Use `sigma \u2248 ball_diameter \u00d7 0.15` (e.g. 12 for an 80px ball, cap ~30). Without blur the shadow reads as a hard ellipse, not as a penumbra. 2. Call `reorder_layer` on EACH shadow layer with `position: 'behind'` and `sibling_layer_id` = the ball's id, to push each shadow BEHIND the ball. New layers ship at the top of the render stack; the shadow needs to be sent back. Without this the shadow paints over the ball. See `motion-patterns.md` \u2192 'Shadow fill' for the full recipe. Reads the ball's animated position to derive `restY` (max y) and impact frames automatically. The shadow ellipse is auto-resized to `ball_diameter \u00d7 ball_diameter` natural size so scale percentages render at the right physical width \u2014 you don't have to compute scale = target_width / natural_width. Prerequisite: the ball must already have animated position (run `apply_bounce` on it first), and both the ball and the shadow must be ellipse SHAPE_LAYERS. **Create the shadow ellipse with CIRCULAR natural size \u2014 `{width: ball_diameter, height: ball_diameter}`. Do NOT pre-flatten the shape (e.g. height=24 for an 80px ball).** The flat-on-the-floor look is produced by this tool keyframing a low `scale.y` constant; if you pre-flatten the shape, the blur falloff zone falls outside the visible ellipse and the user sees a flat dark band. The shadow's fill is preserved through this tool (only size + position + scale + opacity are touched), so apply the fill via `set_fill` BEFORE calling this.",
+    "exposed_via_local_mcp": true
+  },
+  {
+    "group": "ui",
+    "name": "ask_user",
+    "params": [
+      "question",
+      "kind",
+      "choices",
+      "allow_freetext"
+    ],
+    "description": "Pause and ask the user a clarifying question. The user's pick is returned to you as the tool result `{ answer: string }`. Use this *instead of* asking the question in your prose so the UI can render an interactive chip. When to call: - The answer materially changes what you'll build (style direction, scope, target layer when ambiguous). - A sensible default would be wrong often enough that asking is cheaper than redoing. When NOT to call: - You can pick a reasonable default and proceed. Most turns should NOT ask. - The user already specified the answer in their message. - You're just confirming you understood the task. Kinds: - `kind: \"choice\"` \u2014 render as a row of buttons. Provide 2\u20135 short, parallel `choices` (\u226440 chars each). Use for 'A or B?' picks where each option produces a meaningfully different output. Set `allow_freetext: true` to also offer an 'Other\u2026' fallback. - `kind: \"yes_no\"` \u2014 render as Yes/No buttons. Use for confirming an assumption. - `kind: \"open\"` \u2014 render as a free-text input. Use only when the answer space is too broad for choices. Rules: - Do NOT also restate the question in your text \u2014 the chip carries it. - Keep `question` to one short sentence. - For `choice`, choices should be substantively different (not 'fast' vs 'quickly'). - Maximum one ask_user per turn \u2014 chains of questions feel like an interrogation.",
+    "exposed_via_local_mcp": false
+  },
+  {
+    "group": "ui",
+    "name": "inspect_scene",
+    "params": [
+      "frames",
+      "scale",
+      "background_color"
+    ],
+    "description": "Render PNG snapshots of the active Creator scene at one or more frames so you can SEE what's on the canvas \u2014 composition, colors, layout, animation poses. The tool result also includes the current `read_scene` layer state (ids, names, positions, scale, opacity, text metadata, selection, ordering, visual bounds, scene-center deltas, clipping/off-canvas flags, and an `occlusion` block on any layer hidden behind an opaque layer in front of it), so use that state instead of guessing positions or stack order from pixels alone. If a layer you expect to see has `occlusion.likely_hidden`, it is buried (e.g. a label behind a button fill) \u2014 do NOT report it as done; reorder it to the front with `reorder_layer`. **The result is structured issues-first:** (1) a VISIBILITY REPORT listing any occluded / off-canvas / empty / hidden layers (or a clean \u2713), (2) a readable LAYER MAP in render order (#0 = front), (3) the rendered FRAMES, (4) the full raw layer data last. READ the visibility report first, then VERIFY against the frames \u2014 the images are the ground truth. A layer present in the data can still be invisible (occluded, off-canvas, transparent, same-color-on-same-color); never report a layer as done unless you can SEE it in a frame. **ALWAYS pass `frames` explicitly when the scene has motion \u2014 never rely on the default single-playhead snapshot.** Frame 0 alone catches almost nothing: most animations start with opacity:0 or off-screen position, so the snapshot looks empty. Use: - **One-shot reveal / pulse / state change**: `frames: [start, peak, resolve]` where `start` is just before the first beat fires, `peak` is the strongest mid-point of the hero motion (usually the end frame of the hero entrance), `resolve` is a few frames after the last beat ends. For a 0 \u2192 22f card entrance with content cascading to f40, use `[0, 22, 45]`. - **Looping animation** (spinner / ambient pulse / rotation / breath): `frames: [0, end*0.25, end*0.5, end*0.75, end]` \u2014 five evenly-spaced frames across the loop. A single snapshot can never verify a seamless loop. When to call (REQUIRED): - **After any `apply_keyframes` call that produces motion** \u2014 additive or modifying. Use the 3-frame `[start, peak, resolve]` pattern. Yes, even for a 'subtle pulse on one layer' \u2014 a new pulse on a layer that's ALREADY animated can collide with the existing entrance motion, and you only catch that by looking. Skipping this is the #1 source of 'I declared done, user opens it and it's broken' failures. - **After any structural change** (new layer, deletion, fill swap, reorder). - The user describes a visual problem ('it looks off', 'too dark', 'overlapping') and you can't tell from `read_scene` alone. - The user references something visual ('move the logo to the left') and you need to see the current layout. When NOT to call: - Simple structural questions (\"what layers are on the canvas?\") \u2014 `read_scene` is cheaper. - Pure data ops with no visual change: `set_text` on an existing string, `read_scene` to check layer ids, scene metadata fetches. - Do NOT inspect mid-change between every micro-call. Batch your apply_keyframes / create_shape calls, THEN one 3-frame inspect at the end. Defaults: - `frames` omitted \u2192 snapshots the current playhead (RARELY what you want \u2014 see above). - `scale` omitted \u2192 1\u00d7 native scene size. - `background_color` omitted \u2192 transparent (the scene's own background renders if it has one). Limits: at most 6 frames per call, scale clamped to [0.25, 2].",
+    "exposed_via_local_mcp": false
+  }
+]
